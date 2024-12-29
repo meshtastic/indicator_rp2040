@@ -1,14 +1,15 @@
+#include "AHT20.h"
 #include <Arduino.h>
-#include <SensirionI2CSgp40.h>
+#include <PacketSerial.h>
 #include <SensirionI2CScd4x.h>
+#include <SensirionI2CSgp40.h>
 #include <VOCGasIndexAlgorithm.h>
 #include <Wire.h>
-#include <PacketSerial.h>
-#include "AHT20.h"
 
 #define VERSION "v1.0.2M"
 
-#define SENSECAP "\n\
+#define SENSECAP                                                               \
+  "\n\
    _____                      _________    ____         \n\
   / ___/___  ____  ________  / ____/   |  / __ \\       \n\
   \\__ \\/ _ \\/ __ \\/ ___/ _ \\/ /   / /| | / /_/ /   \n\
@@ -26,24 +27,27 @@ VOCGasIndexAlgorithm voc_algorithm;
 
 PacketSerial myPacketSerial;
 
-//Type of transfer packet
+// Type of transfer packet
 
-#define PKT_TYPE_ACK 0x00                  // uin32_t
-#define PKT_TYPE_CMD_COLLECT_INTERVAL 0xA0 // uin32_t
-#define PKT_TYPE_CMD_BEEP_ON 0xA1 // uin32_t  ms: on time
-#define PKT_TYPE_CMD_BEEP_OFF 0xA2   // uin32_t
-#define PKT_TYPE_CMD_SHUTDOWN 0xA3// uin32_t
-#define PKT_TYPE_CMD_POWER_ON 0xA4 // uin32_t
+#define PKT_TYPE_ACK 0x00                   // uin32_t
+#define PKT_TYPE_CMD_COLLECT_INTERVAL 0xA0  // uin32_t in ms
+#define PKT_TYPE_CMD_BEEP_ON 0xA1           // uin32_t duration ms
+#define PKT_TYPE_CMD_BEEP_OFF 0xA2          // uin32_t cancel prematurely
+#define PKT_TYPE_CMD_SHUTDOWN 0xA3          // uin32_t
+#define PKT_TYPE_CMD_POWER_ON 0xA4          // uin32_t
 #define PKT_TYPE_SENSOR_SCD41_TEMP 0xB0     // float
 #define PKT_TYPE_SENSOR_SCD41_HUMIDITY 0xB1 // float
-#define PKT_TYPE_SENSOR_SCD41_CO2 0XB2   // float
-#define PKT_TYPE_SENSOR_AHT20_TEMP 0XB3   // float
-#define PKT_TYPE_SENSOR_AHT20_HUMIDITY 0XB4   // float
-#define PKT_TYPE_SENSOR_TVOC_INDEX 0XB5   // float
+#define PKT_TYPE_SENSOR_SCD41_CO2 0XB2      // float
+#define PKT_TYPE_SENSOR_AHT20_TEMP 0XB3     // float
+#define PKT_TYPE_SENSOR_AHT20_HUMIDITY 0XB4 // float
+#define PKT_TYPE_SENSOR_TVOC_INDEX 0XB5     // float
+
+bool active = false;
+uint32_t collectInterval = 5000;
 
 // sensor data send to  esp32
 void sensor_data_send(uint8_t type, float data) {
-  uint8_t data_buf[32] = { 0 };
+  uint8_t data_buf[32] = {0};
   int index = 0;
 
   data_buf[0] = type;
@@ -70,17 +74,6 @@ void printSerialNumber(uint16_t serial0, uint16_t serial1, uint16_t serial2) {
   Serial.println();
 }
 
-void sensor_power_on(void) {
-  pinMode(18, OUTPUT);
-  digitalWrite(18, HIGH);
-}
-
-void sensor_power_off(void) {
-  pinMode(18, OUTPUT);
-  digitalWrite(18, LOW);
-}
-
-
 float temperature = 0.0;
 float humidity = 0.0;
 
@@ -92,17 +85,16 @@ uint16_t compensationT = defaultCompenstaionT;
 
 /************************ aht  temp & humidity ****************************/
 
-void sensor_aht_init(void) {
-  AHT.begin();
-}
+void sensor_aht_init(void) { AHT.begin(); }
 
 void sensor_aht_get(void) {
 
   float humi, temp;
 
   int ret = AHT.getSensor(&humi, &temp);
-  if (ret)  // GET DATA OK
-  {
+
+  if (ret) {
+    // GET DATA OK
     Serial.print("humidity: ");
     Serial.print(humi * 100);
     Serial.print("%\t temerature: ");
@@ -111,19 +103,16 @@ void sensor_aht_get(void) {
     humidity = humi * 100;
     compensationT = static_cast<uint16_t>((temperature + 45) * 65535 / 175);
     compensationRh = static_cast<uint16_t>(humidity * 65535 / 100);
-  } else  // GET DATA FAIL
-  {
+  } else {
+    // GET DATA FAIL
     Serial.println("GET DATA FROM AHT20 FAIL");
     compensationRh = defaultCompenstaionRh;
     compensationT = defaultCompenstaionT;
   }
 
-   if (ret) {
-
-
+  if (ret) {
     sensor_data_send(PKT_TYPE_SENSOR_AHT20_TEMP, temperature);
     sensor_data_send(PKT_TYPE_SENSOR_AHT20_HUMIDITY, humidity);
- 
   }
 }
 
@@ -188,10 +177,7 @@ void sensor_sgp40_get(void) {
     Serial.println(srawVoc);
   }
 
-
   if (!error) {
-   
-
     int32_t voc_index = voc_algorithm.process(srawVoc);
     Serial.print("VOC Index: ");
     Serial.println(voc_index);
@@ -199,7 +185,6 @@ void sensor_sgp40_get(void) {
     sensor_data_send(PKT_TYPE_SENSOR_TVOC_INDEX, (float)voc_index);
   }
 }
-
 
 /************************ scd4x  co2 ****************************/
 
@@ -266,33 +251,41 @@ void sensor_scd4x_get(void) {
     Serial.println(humidity);
   }
 
- 
   if (!error) {
-  
-   
-
-
-    sensor_data_send(PKT_TYPE_SENSOR_SCD41_CO2, (float)co2);  //todo
+    sensor_data_send(PKT_TYPE_SENSOR_SCD41_CO2, (float)co2);
+    sensor_data_send(PKT_TYPE_SENSOR_SCD41_TEMP, temperature);
+    sensor_data_send(PKT_TYPE_SENSOR_SCD41_HUMIDITY, humidity);
   }
+}
+
+void sensor_power_on(void) {
+  pinMode(18, OUTPUT);
+  digitalWrite(18, HIGH);
+  active = true;
+  delay(100);
+  sensor_aht_init();
+  sensor_sgp40_init();
+  sensor_scd4x_init();
+}
+
+void sensor_power_off(void) {
+  pinMode(18, OUTPUT);
+  digitalWrite(18, LOW);
+  active = false;
 }
 
 /************************ beep ****************************/
 
-#define Buzzer 19  //Buzzer GPIO
+#define Buzzer 19 // Buzzer GPIO
 
-void beep_init(void) {
-  pinMode(Buzzer, OUTPUT);
-}
-void beep_off(void) {
-  digitalWrite(19, LOW);
-}
-void beep_on(void) {
+uint32_t buzz_off = 0;
+
+void beep_init(void) { pinMode(Buzzer, OUTPUT); }
+void beep_off(void) { digitalWrite(Buzzer, LOW); }
+void beep_on(uint32_t duration) {
   analogWrite(Buzzer, 127);
-  delay(50);
-  analogWrite(Buzzer, 0);
+  buzz_off = millis() + duration;
 }
-
-
 
 /************************ grove  ****************************/
 
@@ -307,7 +300,6 @@ void grove_adc_get(void) {
   Serial.println(dataString);
 }
 
-
 /************************ recv cmd from esp32  ****************************/
 
 static bool shutdown_flag = false;
@@ -317,46 +309,42 @@ void onPacketReceived(const uint8_t *buffer, size_t size) {
     return;
   }
   switch (buffer[0]) {
-    case PKT_TYPE_CMD_POWER_ON:
-      {
-        Serial.println("cmd power on");
-        sensor_power_on();
-        break;
-      }
-    case PKT_TYPE_CMD_SHUTDOWN:
-      {
-        Serial.println("cmd shutdown");
-        shutdown_flag = true;
-        sensor_power_off();
-        break;
-      }
-    case PKT_TYPE_CMD_BEEP_ON:
-      {
-        Serial.println("cmd beep on");
-        beep_on();
-        break;
-      }
-    case PKT_TYPE_CMD_BEEP_OFF:
-      {
-        Serial.println("cmd beep off");
-        beep_off();
-        break;
-      }
-    case PKT_TYPE_CMD_COLLECT_INTERVAL:
-      {
-        Serial.println("cmd collect interval");
-        break;
-      }
-    
-    default:
-      break;
+  case PKT_TYPE_CMD_POWER_ON: {
+    Serial.println("cmd power on");
+    sensor_power_on();
+    break;
+  }
+  case PKT_TYPE_CMD_SHUTDOWN: {
+    Serial.println("cmd shutdown");
+    shutdown_flag = true;
+    sensor_power_off();
+    break;
+  }
+  case PKT_TYPE_CMD_BEEP_ON: {
+    Serial.println("cmd beep on");
+    beep_on(atol((char *)(buffer + 1)));
+    break;
+  }
+  case PKT_TYPE_CMD_BEEP_OFF: {
+    Serial.println("cmd beep off");
+    beep_off();
+    break;
+  }
+  case PKT_TYPE_CMD_COLLECT_INTERVAL: {
+    Serial.println("cmd collect interval");
+    collectInterval = atol((char *)(buffer + 1));
+    break;
+  }
+
+  default:
+    break;
   }
 }
 
 /************************ setuo & loop ****************************/
 
 int cnt = 0;
-int i = 0;
+uint32_t sent = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -367,15 +355,9 @@ void setup() {
   myPacketSerial.setStream(&Serial1);
   myPacketSerial.setPacketHandler(&onPacketReceived);
 
-  sensor_power_on();
-
   Wire.setSDA(20);
   Wire.setSCL(21);
   Wire.begin();
-
-  sensor_aht_init();
-  sensor_sgp40_init();
-  sensor_scd4x_init();
 
   int32_t index_offset;
   int32_t learning_time_offset_hours;
@@ -384,8 +366,8 @@ void setup() {
   int32_t std_initial;
   int32_t gain_factor;
   voc_algorithm.get_tuning_parameters(
-    index_offset, learning_time_offset_hours, learning_time_gain_hours,
-    gating_max_duration_minutes, std_initial, gain_factor);
+      index_offset, learning_time_offset_hours, learning_time_gain_hours,
+      gating_max_duration_minutes, std_initial, gain_factor);
 
   Serial.println("\nVOC Gas Index Algorithm parameters");
   Serial.print("Index offset:\t");
@@ -403,28 +385,27 @@ void setup() {
 
   beep_init();
   delay(500);
-  beep_on();
+  beep_on(50);
 
   Serial.printf(SENSECAP, VERSION);
 }
 
 void loop() {
-  if (i > 500) {
-    i = 0;
 
- 
+  if ((sent > 0 && millis() - sent > collectInterval) && (active)) {
     Serial.printf("\r\n\r\n--------- start measure %d-------\r\n", cnt);
-
-   
-
     cnt++;
     sensor_aht_get();
     sensor_sgp40_get();
     sensor_scd4x_get();
     grove_adc_get();
+    sent = millis();
   }
 
-  i++;
+  if (buzz_off > 0 && millis() > buzz_off) {
+    beep_off();
+    buzz_off = 0;
+  }
 
   myPacketSerial.update();
   if (myPacketSerial.overflow()) {
