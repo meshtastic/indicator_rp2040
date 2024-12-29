@@ -331,8 +331,8 @@ void onPacketReceived(const uint8_t *buffer, size_t size) {
     break;
   }
   case PKT_TYPE_CMD_COLLECT_INTERVAL: {
-    Serial.println("cmd collect interval");
     collectInterval = atol((char *)(buffer + 1));
+    Serial.println("cmd collect interval " + String(collectInterval));
     break;
   }
 
@@ -392,7 +392,7 @@ void setup() {
 
 void loop() {
 
-  if ((sent > 0 && millis() - sent > collectInterval) && (active)) {
+  if ((sent == 0 || (millis() - sent > collectInterval)) && (active)) {
     Serial.printf("\r\n\r\n--------- start measure %d-------\r\n", cnt);
     cnt++;
     sensor_aht_get();
