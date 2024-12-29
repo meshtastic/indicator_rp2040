@@ -266,6 +266,7 @@ void sensor_power_on(void) {
   sensor_aht_init();
   sensor_sgp40_init();
   sensor_scd4x_init();
+  sent = 0;
 }
 
 void sensor_power_off(void) {
