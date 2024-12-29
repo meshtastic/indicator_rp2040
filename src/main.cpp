@@ -83,6 +83,8 @@ uint16_t defaultCompenstaionT = 0x6666;
 uint16_t compensationRh = defaultCompenstaionRh;
 uint16_t compensationT = defaultCompenstaionT;
 
+uint32_t sent = 0;
+
 /************************ aht  temp & humidity ****************************/
 
 void sensor_aht_init(void) { AHT.begin(); }
@@ -345,7 +347,6 @@ void onPacketReceived(const uint8_t *buffer, size_t size) {
 /************************ setuo & loop ****************************/
 
 int cnt = 0;
-uint32_t sent = 0;
 
 void setup() {
   Serial.begin(115200);
