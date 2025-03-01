@@ -1,6 +1,6 @@
 #include "AHT20.h"
+#include "serial_proto.h"
 #include <Arduino.h>
-#include <PacketSerial.h>
 #include <SensirionI2CScd4x.h>
 #include <SensirionI2CSgp40.h>
 #include <VOCGasIndexAlgorithm.h>
@@ -22,55 +22,44 @@
 
 AHT20 AHT;
 SensirionI2CSgp40 sgp40;
-SensirionI2CScd4x scd4x;
+SensirionI2cScd4x scd4x;
 VOCGasIndexAlgorithm voc_algorithm;
 
-PacketSerial myPacketSerial;
-
-// Type of transfer packet
-
-#define PKT_TYPE_ACK 0x00                   // uin32_t
-#define PKT_TYPE_CMD_COLLECT_INTERVAL 0xA0  // uin32_t in ms
-#define PKT_TYPE_CMD_BEEP_ON 0xA1           // uin32_t duration ms
-#define PKT_TYPE_CMD_BEEP_OFF 0xA2          // uin32_t cancel prematurely
-#define PKT_TYPE_CMD_SHUTDOWN 0xA3          // uin32_t
-#define PKT_TYPE_CMD_POWER_ON 0xA4          // uin32_t
-#define PKT_TYPE_SENSOR_SCD41_TEMP 0xB0     // float
-#define PKT_TYPE_SENSOR_SCD41_HUMIDITY 0xB1 // float
-#define PKT_TYPE_SENSOR_SCD41_CO2 0XB2      // float
-#define PKT_TYPE_SENSOR_AHT20_TEMP 0XB3     // float
-#define PKT_TYPE_SENSOR_AHT20_HUMIDITY 0XB4 // float
-#define PKT_TYPE_SENSOR_TVOC_INDEX 0XB5     // float
+const int BUFFER_SIZE =
+    1024; // Buffer size for NMEA sentences (generous for Multi-GNSS)
+char nmeaBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
 
 bool active = false;
 uint32_t collectInterval = 5000;
 
 // sensor data send to  esp32
-void sensor_data_send(uint8_t type, float data) {
-  uint8_t data_buf[32] = {0};
-  int index = 0;
-
-  data_buf[0] = type;
-  index++;
-
-  memcpy(&data_buf[1], &data, sizeof(float));
-  index += sizeof(float);
-
-  myPacketSerial.send(data_buf, index);
+void sensor_data_send(meshtastic_MessageType type, float data) {
+  meshtastic_InterdeviceMessage myPacket =
+      meshtastic_InterdeviceMessage_init_default;
+  myPacket.data.sensor.type = type;
+  myPacket.data.sensor.data.float_value = data;
+  mt_send_uplink(myPacket);
 }
 
-void printUint16Hex(uint16_t value) {
-  Serial.print(value < 4096 ? "0" : "");
-  Serial.print(value < 256 ? "0" : "");
-  Serial.print(value < 16 ? "0" : "");
-  Serial.print(value, HEX);
-}
-
-void printSerialNumber(uint16_t serial0, uint16_t serial1, uint16_t serial2) {
+void printSerialNumber(uint64_t value) {
   Serial.print("Serial: 0x");
-  printUint16Hex(serial0);
-  printUint16Hex(serial1);
-  printUint16Hex(serial2);
+  Serial.print(value < 0x1000000000000000 ? "0" : "");
+  Serial.print(value < 0x100000000000000 ? "0" : "");
+  Serial.print(value < 0x10000000000000 ? "0" : "");
+  Serial.print(value < 0x1000000000000 ? "0" : "");
+  Serial.print(value < 0x100000000000 ? "0" : "");
+  Serial.print(value < 0x10000000000 ? "0" : "");
+  Serial.print(value < 0x1000000000 ? "0" : "");
+  Serial.print(value < 0x100000000 ? "0" : "");
+  Serial.print(value < 0x10000000 ? "0" : "");
+  Serial.print(value < 0x1000000 ? "0" : "");
+  Serial.print(value < 0x100000 ? "0" : "");
+  Serial.print(value < 0x10000 ? "0" : "");
+  Serial.print(value < 0x1000 ? "0" : "");
+  Serial.print(value < 0x100 ? "0" : "");
+  Serial.print(value < 0x10 ? "0" : "");
+  Serial.print(value, HEX);
   Serial.println();
 }
 
@@ -113,8 +102,8 @@ void sensor_aht_get(void) {
   }
 
   if (ret) {
-    sensor_data_send(PKT_TYPE_SENSOR_AHT20_TEMP, temperature);
-    sensor_data_send(PKT_TYPE_SENSOR_AHT20_HUMIDITY, humidity);
+    sensor_data_send(meshtastic_MessageType_AHT20_TEMP, temperature);
+    sensor_data_send(meshtastic_MessageType_AHT20_HUMIDITY, humidity);
   }
 }
 
@@ -184,7 +173,7 @@ void sensor_sgp40_get(void) {
     Serial.print("VOC Index: ");
     Serial.println(voc_index);
 
-    sensor_data_send(PKT_TYPE_SENSOR_TVOC_INDEX, (float)voc_index);
+    sensor_data_send(meshtastic_MessageType_TVOC_INDEX, (float)voc_index);
   }
 }
 
@@ -194,7 +183,7 @@ void sensor_scd4x_init(void) {
   uint16_t error;
   char errorMessage[256];
 
-  scd4x.begin(Wire);
+  scd4x.begin(Wire, 0x62);
 
   // stop potentially previously started measurement
   error = scd4x.stopPeriodicMeasurement();
@@ -204,16 +193,15 @@ void sensor_scd4x_init(void) {
     Serial.println(errorMessage);
   }
 
-  uint16_t serial0;
-  uint16_t serial1;
-  uint16_t serial2;
-  error = scd4x.getSerialNumber(serial0, serial1, serial2);
+  uint64_t serial;
+
+  error = scd4x.getSerialNumber(serial);
   if (error) {
     Serial.print("Error trying to execute getSerialNumber(): ");
     errorToString(error, errorMessage, 256);
     Serial.println(errorMessage);
   } else {
-    printSerialNumber(serial0, serial1, serial2);
+    printSerialNumber(serial);
   }
 
   // Start Measurement
@@ -254,9 +242,9 @@ void sensor_scd4x_get(void) {
   }
 
   if (!error) {
-    sensor_data_send(PKT_TYPE_SENSOR_SCD41_CO2, (float)co2);
-    sensor_data_send(PKT_TYPE_SENSOR_SCD41_TEMP, temperature);
-    sensor_data_send(PKT_TYPE_SENSOR_SCD41_HUMIDITY, humidity);
+    sensor_data_send(meshtastic_MessageType_SCD41_CO2, (float)co2);
+    sensor_data_send(meshtastic_MessageType_SCD41_TEMP, temperature);
+    sensor_data_send(meshtastic_MessageType_SCD41_HUMIDITY, humidity);
   }
 }
 
@@ -292,49 +280,48 @@ void beep_on(uint32_t duration) {
 
 /************************ grove  ****************************/
 
-void grove_adc_get(void) {
-  String dataString = "";
-  int adc0 = analogRead(26);
-  dataString += String(adc0);
-  dataString += ',';
-  int adc1 = analogRead(27);
-  dataString += String(adc1);
-  Serial.print("grove adc: ");
-  Serial.println(dataString);
-}
+// Don't send this for now, we need the 2nd port for the GPS
+
+// void grove_adc_get(void) {
+//   String dataString = "";
+//   int adc0 = analogRead(26);
+//   dataString += String(adc0);
+//   dataString += ',';
+//   int adc1 = analogRead(27);
+//   dataString += String(adc1);
+//   Serial.print("grove adc: ");
+//   Serial.println(dataString);
+// }
 
 /************************ recv cmd from esp32  ****************************/
 
 static bool shutdown_flag = false;
 
-void onPacketReceived(const uint8_t *buffer, size_t size) {
-  if (size < 1) {
-    return;
-  }
-  switch (buffer[0]) {
-  case PKT_TYPE_CMD_POWER_ON: {
+void onPacketReceived(meshtastic_SensorData sensor) {
+  switch (sensor.type) {
+  case meshtastic_MessageType_POWER_ON: {
     Serial.println("cmd power on");
     sensor_power_on();
     break;
   }
-  case PKT_TYPE_CMD_SHUTDOWN: {
+  case meshtastic_MessageType_SHUTDOWN: {
     Serial.println("cmd shutdown");
     shutdown_flag = true;
     sensor_power_off();
     break;
   }
-  case PKT_TYPE_CMD_BEEP_ON: {
+  case meshtastic_MessageType_BEEP_ON: {
     Serial.println("cmd beep on");
-    beep_on(atol((char *)(buffer + 1)));
+    beep_on(sensor.data.uint32_value);
     break;
   }
-  case PKT_TYPE_CMD_BEEP_OFF: {
+  case meshtastic_MessageType_BEEP_OFF: {
     Serial.println("cmd beep off");
     beep_off();
     break;
   }
-  case PKT_TYPE_CMD_COLLECT_INTERVAL: {
-    collectInterval = atol((char *)(buffer + 1));
+  case meshtastic_MessageType_COLLECT_INTERVAL: {
+    collectInterval = sensor.data.uint32_value;
     Serial.println("cmd collect interval " + String(collectInterval));
     break;
   }
@@ -344,22 +331,36 @@ void onPacketReceived(const uint8_t *buffer, size_t size) {
   }
 }
 
-/************************ setuo & loop ****************************/
+void onNmeaReceived(meshtastic_NmeaString nmea) {
+  // pass this on to the GPS chip
+  Serial2.print(nmea.nmea);
+}
+
+/************************ setup & loop ****************************/
 
 int cnt = 0;
 
 void setup() {
+  // The Virtual USB Serial
   Serial.begin(115200);
 
+  // this is the device link to the ESP32-S3 CPU
   Serial1.setRX(17);
   Serial1.setTX(16);
   Serial1.begin(115200);
-  myPacketSerial.setStream(&Serial1);
-  myPacketSerial.setPacketHandler(&onPacketReceived);
 
+  // use pin 26 and 27 for the GPS Chip serial link
+  Serial2.setRX(27);
+  Serial2.setTX(26);
+  Serial2.begin(9600);
+
+  // I2C is on 20/21
   Wire.setSDA(20);
   Wire.setSCL(21);
   Wire.begin();
+
+  mt_set_sensor_callback(onPacketReceived);
+  mt_set_nmea_callback(onNmeaReceived);
 
   int32_t index_offset;
   int32_t learning_time_offset_hours;
@@ -400,7 +401,8 @@ void loop() {
     sensor_aht_get();
     sensor_sgp40_get();
     sensor_scd4x_get();
-    grove_adc_get();
+    // Don't send this for now, we need the 2nd port for the GPS
+    // grove_adc_get();
     sent = millis();
   }
 
@@ -409,8 +411,24 @@ void loop() {
     buzz_off = 0;
   }
 
-  myPacketSerial.update();
-  if (myPacketSerial.overflow()) {
+  // read GPS data lines into buffer and send it to the ESP32
+  while (Serial2.available()) {
+    char c = Serial2.read();
+
+    if (c == '\n') {
+      nmeaBuffer[bufferIndex] = '\0';
+      meshtastic_InterdeviceMessage myPacket =
+          meshtastic_InterdeviceMessage_init_default;
+      strncpy(myPacket.data.nmea.nmea, nmeaBuffer, bufferIndex);
+      mt_send_uplink(myPacket);
+      bufferIndex = 0;
+      break;
+    } else {
+      if (bufferIndex < BUFFER_SIZE - 1) {
+        nmeaBuffer[bufferIndex++] = c;
+      } else {
+        bufferIndex = 0; // Reset in case of buffer overflow
+      }
+    }
   }
-  delay(10);
 }
