@@ -16,7 +16,7 @@
 
 ## Features
 - Finer sensor control
-- Passes values from an NMEA-connected GPS module to the uplink CPU
+- Passes values from a NMEA-connected GPS module to the uplink CPU
 - Future development: Adding SDCard support
 
 ## Installation
