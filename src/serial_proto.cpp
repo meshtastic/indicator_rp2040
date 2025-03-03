@@ -10,7 +10,7 @@ pb_byte_t pb_buf[PB_BUFSIZE];
 size_t pb_size = 0; // Number of bytes currently in the buffer
 
 void (*sensor_callback)(meshtastic_SensorData sensor) = NULL;
-void (*nmea_callback)(meshtastic_NmeaString nmea) = NULL;
+void (*nmea_callback)(char *nmea) = NULL;
 
 bool mt_send(const char *buf, size_t len) {
   size_t wrote = Serial1.write(buf, len);
@@ -21,7 +21,7 @@ bool mt_send(const char *buf, size_t len) {
 
 // Parse a packet that came in, and handle it. Return true if we were able to
 // parse it.
-bool mt_handle_packet(uint32_t now, size_t payload_len) {
+bool mt_handle_packet(size_t payload_len) {
   meshtastic_InterdeviceMessage message =
       meshtastic_InterdeviceMessage_init_zero;
 
@@ -57,7 +57,7 @@ bool mt_handle_packet(uint32_t now, size_t payload_len) {
   }
 }
 
-void mt_check_packet(uint32_t now) {
+void mt_check_packet() {
   if (pb_size < MT_HEADER_SIZE) {
     // We don't even have a header yet
     delay(NO_NEWS_PAUSE);
@@ -83,7 +83,7 @@ void mt_check_packet(uint32_t now) {
   }
 
   // We have a complete packet, handle it
-  mt_handle_packet(now, payload_len);
+  mt_handle_packet(payload_len);
 }
 
 size_t mt_serial_check(char *buf, size_t space_left) {
@@ -121,8 +121,7 @@ bool mt_send_uplink(meshtastic_InterdeviceMessage message) {
   return rv;
 }
 
-bool mt_loop(uint32_t now) {
-  bool rv;
+void mt_loop() {
   size_t bytes_read = 0;
 
   // See if there are any more bytes to add to our buffer.
@@ -131,14 +130,13 @@ bool mt_loop(uint32_t now) {
   bytes_read = mt_serial_check((char *)pb_buf + pb_size, space_left);
 
   pb_size += bytes_read;
-  mt_check_packet(now);
-  return rv;
+  mt_check_packet();
 }
 
 void mt_set_sensor_callback(void (*callback)(meshtastic_SensorData sensor)) {
   sensor_callback = callback;
 }
 
-void mt_set_nmea_callback(void (*callback)(meshtastic_NmeaString nmea)) {
+void mt_set_nmea_callback(void (*callback)(char *nmea)) {
   nmea_callback = callback;
 }

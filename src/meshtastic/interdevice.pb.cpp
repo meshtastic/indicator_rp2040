@@ -6,8 +6,6 @@
 #error Regenerate this file with the current version of nanopb generator.
 #endif
 
-PB_BIND(meshtastic_NmeaString, meshtastic_NmeaString, 2)
-
 PB_BIND(meshtastic_SensorData, meshtastic_SensorData, AUTO)
 
 PB_BIND(meshtastic_InterdeviceMessage, meshtastic_InterdeviceMessage, 2)

@@ -26,11 +26,6 @@ typedef enum _meshtastic_MessageType {
 } meshtastic_MessageType;
 
 /* Struct definitions */
-typedef struct _meshtastic_NmeaString {
-  /* The NMEA string */
-  char nmea[1024];
-} meshtastic_NmeaString;
-
 typedef struct _meshtastic_SensorData {
   /* The message type */
   meshtastic_MessageType type;
@@ -44,7 +39,7 @@ typedef struct _meshtastic_SensorData {
 typedef struct _meshtastic_InterdeviceMessage {
   pb_size_t which_data;
   union {
-    meshtastic_NmeaString nmea;
+    char nmea[1024];
     meshtastic_SensorData sensor;
   } data;
 } meshtastic_InterdeviceMessage;
@@ -62,29 +57,24 @@ extern "C" {
 #define meshtastic_SensorData_type_ENUMTYPE meshtastic_MessageType
 
 /* Initializer values for message structs */
-#define meshtastic_NmeaString_init_default                                     \
-  { "" }
 #define meshtastic_SensorData_init_default                                     \
   {                                                                            \
     _meshtastic_MessageType_MIN, 0, { 0 }                                      \
   }
 #define meshtastic_InterdeviceMessage_init_default                             \
   {                                                                            \
-    0, { meshtastic_NmeaString_init_default }                                  \
+    0, { "" }                                                                  \
   }
-#define meshtastic_NmeaString_init_zero                                        \
-  { "" }
 #define meshtastic_SensorData_init_zero                                        \
   {                                                                            \
     _meshtastic_MessageType_MIN, 0, { 0 }                                      \
   }
 #define meshtastic_InterdeviceMessage_init_zero                                \
   {                                                                            \
-    0, { meshtastic_NmeaString_init_zero }                                     \
+    0, { "" }                                                                  \
   }
 
 /* Field tags (for use in manual encoding/decoding) */
-#define meshtastic_NmeaString_nmea_tag 1
 #define meshtastic_SensorData_type_tag 1
 #define meshtastic_SensorData_float_value_tag 2
 #define meshtastic_SensorData_uint32_value_tag 3
@@ -92,11 +82,6 @@ extern "C" {
 #define meshtastic_InterdeviceMessage_sensor_tag 2
 
 /* Struct field encoding specification for nanopb */
-#define meshtastic_NmeaString_FIELDLIST(X, a)                                  \
-  X(a, STATIC, SINGULAR, STRING, nmea, 1)
-#define meshtastic_NmeaString_CALLBACK NULL
-#define meshtastic_NmeaString_DEFAULT NULL
-
 #define meshtastic_SensorData_FIELDLIST(X, a)                                  \
   X(a, STATIC, SINGULAR, UENUM, type, 1)                                       \
   X(a, STATIC, ONEOF, FLOAT, (data, float_value, data.float_value), 2)         \
@@ -105,27 +90,23 @@ extern "C" {
 #define meshtastic_SensorData_DEFAULT NULL
 
 #define meshtastic_InterdeviceMessage_FIELDLIST(X, a)                          \
-  X(a, STATIC, ONEOF, MESSAGE, (data, nmea, data.nmea), 1)                     \
+  X(a, STATIC, ONEOF, STRING, (data, nmea, data.nmea), 1)                      \
   X(a, STATIC, ONEOF, MESSAGE, (data, sensor, data.sensor), 2)
 #define meshtastic_InterdeviceMessage_CALLBACK NULL
 #define meshtastic_InterdeviceMessage_DEFAULT NULL
-#define meshtastic_InterdeviceMessage_data_nmea_MSGTYPE meshtastic_NmeaString
 #define meshtastic_InterdeviceMessage_data_sensor_MSGTYPE meshtastic_SensorData
 
-extern const pb_msgdesc_t meshtastic_NmeaString_msg;
 extern const pb_msgdesc_t meshtastic_SensorData_msg;
 extern const pb_msgdesc_t meshtastic_InterdeviceMessage_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
-#define meshtastic_NmeaString_fields &meshtastic_NmeaString_msg
 #define meshtastic_SensorData_fields &meshtastic_SensorData_msg
 #define meshtastic_InterdeviceMessage_fields &meshtastic_InterdeviceMessage_msg
 
 /* Maximum encoded size of messages (where known) */
 #define MESHTASTIC_MESHTASTIC_INTERDEVICE_PB_H_MAX_SIZE                        \
   meshtastic_InterdeviceMessage_size
-#define meshtastic_InterdeviceMessage_size 1029
-#define meshtastic_NmeaString_size 1026
+#define meshtastic_InterdeviceMessage_size 1026
 #define meshtastic_SensorData_size 9
 
 #ifdef __cplusplus
