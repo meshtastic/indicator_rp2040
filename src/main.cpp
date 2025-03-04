@@ -331,9 +331,9 @@ void onPacketReceived(meshtastic_SensorData sensor) {
   }
 }
 
-void onNmeaReceived(meshtastic_NmeaString nmea) {
+void onNmeaReceived(char *nmea) {
   // pass this on to the GPS chip
-  Serial2.print(nmea.nmea);
+  Serial2.print(nmea);
 }
 
 /************************ setup & loop ****************************/
@@ -411,15 +411,18 @@ void loop() {
     buzz_off = 0;
   }
 
+  mt_loop();
+
   // read GPS data lines into buffer and send it to the ESP32
   while (Serial2.available()) {
     char c = Serial2.read();
 
     if (c == '\n') {
       nmeaBuffer[bufferIndex] = '\0';
+      Serial.print(nmeaBuffer);
       meshtastic_InterdeviceMessage myPacket =
           meshtastic_InterdeviceMessage_init_default;
-      strncpy(myPacket.data.nmea.nmea, nmeaBuffer, bufferIndex);
+      strncpy(myPacket.data.nmea, nmeaBuffer, bufferIndex);
       mt_send_uplink(myPacket);
       bufferIndex = 0;
       break;

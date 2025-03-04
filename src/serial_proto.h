@@ -25,6 +25,8 @@ bool mt_send_uplink(meshtastic_InterdeviceMessage message);
 void mt_set_sensor_callback(void (*callback)(meshtastic_SensorData sensor));
 
 // Set callback function that gets called when nmea message is received
-void mt_set_nmea_callback(void (*callback)(meshtastic_NmeaString nmea));
+void mt_set_nmea_callback(void (*callback)(char *nmea));
+
+void mt_loop();
 
 #endif
