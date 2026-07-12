@@ -4,6 +4,7 @@
 #include <Wire.h>
 
 extern bool sd_ensure(void);
+extern bool sd_used_free(uint64_t *used, uint64_t *free_bytes);
 
 // One-entry read cache: map tiles are fetched in sequential 4K chunks, so
 // keeping the file open between chunks avoids a FAT open + seek per chunk
@@ -295,10 +296,11 @@ bool mt_handle_packet(size_t payload_len) {
       default:
         info->card_type = meshtastic_SdCardInfo_CardType_UNKNOWN_CARD;
       }
-      FSInfo fs_info;
-      if (SDFS.info(fs_info)) {
-        info->used_bytes = fs_info.usedBytes;
-        info->free_bytes = fs_info.totalBytes - fs_info.usedBytes;
+      // from the background scan; zero while it is still running
+      uint64_t used, free_bytes;
+      if (sd_used_free(&used, &free_bytes)) {
+        info->used_bytes = used;
+        info->free_bytes = free_bytes;
       }
     }
     return mt_send_uplink(response);

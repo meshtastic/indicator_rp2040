@@ -30,6 +30,14 @@ int bufferIndex = 0;
 bool sd_init_flag = 0;
 const int SD_CS_PIN = 13;
 
+// used/free statistics, computed in the background: the FAT scan behind
+// usedBytes takes seconds on FAT16/32 cards and must not stall the
+// request path (the UI on the other end waits synchronously)
+static bool sd_stats_pending = false;
+static bool sd_stats_valid = false;
+static uint64_t sd_used_bytes = 0;
+static uint64_t sd_free_bytes = 0;
+
 // (Re-)initialize the SD card on demand. The Indicator's slot has no
 // card-detect line, so retry rate-limited whenever a file operation
 // arrives; this makes inserting a card after boot just work.
@@ -46,6 +54,30 @@ bool sd_ensure(void) {
   }
   Serial.println("card initialized.");
   sd_init_flag = 1;
+  sd_stats_valid = false;
+  sd_stats_pending = true;
+  return true;
+}
+
+// runs from loop(), outside the request path
+void sd_update_stats(void) {
+  if (!sd_stats_pending || !sd_init_flag)
+    return;
+  sd_stats_pending = false;
+  FSInfo info;
+  if (SDFS.info(info)) {
+    sd_used_bytes = info.usedBytes;
+    sd_free_bytes = info.totalBytes - info.usedBytes;
+    sd_stats_valid = true;
+  }
+}
+
+// false while the background scan has not completed yet
+bool sd_used_free(uint64_t *used, uint64_t *free_bytes) {
+  if (!sd_stats_valid)
+    return false;
+  *used = sd_used_bytes;
+  *free_bytes = sd_free_bytes;
   return true;
 }
 
@@ -107,6 +139,7 @@ void loop() {
     buzz_off = 0;
   }
 
+  sd_update_stats();
   mt_loop();
 
   // read GPS data lines into buffer and send it to the ESP32
