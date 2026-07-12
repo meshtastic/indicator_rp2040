@@ -9,16 +9,16 @@
 PB_BIND(meshtastic_FileTransfer, meshtastic_FileTransfer, 4)
 
 
-PB_BIND(meshtastic_DirectoryListing, meshtastic_DirectoryListing, 2)
+PB_BIND(meshtastic_DirectoryListing, meshtastic_DirectoryListing, 4)
 
 
-PB_BIND(meshtastic_I2CTransaction, meshtastic_I2CTransaction, AUTO)
+PB_BIND(meshtastic_I2CTransaction, meshtastic_I2CTransaction, 2)
 
 
 PB_BIND(meshtastic_SdCardInfo, meshtastic_SdCardInfo, AUTO)
 
 
-PB_BIND(meshtastic_I2CResult, meshtastic_I2CResult, AUTO)
+PB_BIND(meshtastic_I2CResult, meshtastic_I2CResult, 2)
 
 
 PB_BIND(meshtastic_InterdeviceMessage, meshtastic_InterdeviceMessage, 4)

@@ -50,30 +50,39 @@ typedef struct _meshtastic_FileTransfer {
     meshtastic_FileTransfer_filedata_t filedata; /* Chunk content (POST/PUT request, GET response) */
     bool success; /* Response: Was the operation successful? */
     char message[255]; /* Response: Status message */
-    uint32_t offset; /* Byte offset of this chunk within the file (ranged GET/PUT) */
-    uint32_t length; /* GET request: number of bytes to read (0 = max chunk size) */
-    uint32_t file_size; /* GET response: total size of the file */
+    uint64_t offset; /* Byte offset of this chunk within the file (ranged GET/PUT) */
+    /* GET request: number of bytes to read, 0 = max chunk size. A response
+ carries at most the filedata max_size (see interdevice.options) per
+ chunk; larger requests are truncated, visible in the filedata length. */
+    uint32_t length;
+    uint64_t file_size; /* GET response: total size of the file */
 } meshtastic_FileTransfer;
 
 /* Message for structured directory listing */
 typedef struct _meshtastic_DirectoryListing {
     char directory[255]; /* Path of the directory */
+    /* One page of entry names, full FAT LFN length so they round-trip into
+ FileTransfer.filepath. Page size is the max_count in
+ interdevice.options; page through with offset and total_count. */
     pb_size_t filenames_count;
-    char filenames[32][41]; /* List of file names */
+    char filenames[16][256];
     bool success; /* Response: Was the operation successful? */
     char message[255]; /* Response: Status message */
     uint32_t offset; /* Request: skip this many entries (paging) */
     uint32_t total_count; /* Response: total number of entries in the directory */
 } meshtastic_DirectoryListing;
 
-typedef PB_BYTES_ARRAY_T(64) meshtastic_I2CTransaction_write_data_t;
+typedef PB_BYTES_ARRAY_T(256) meshtastic_I2CTransaction_write_data_t;
 /* A single I2C transaction: an optional write followed by an optional
  read with repeated start, matching the TwoWire usage of sensor drivers
  (beginTransmission/write.../endTransmission(false)/requestFrom) */
 typedef struct _meshtastic_I2CTransaction {
     uint32_t address; /* 7-bit device address */
     meshtastic_I2CTransaction_write_data_t write_data; /* Bytes to write, may be empty */
-    uint32_t read_len; /* Number of bytes to read after the write, 0 = write-only */
+    /* Number of bytes to read after the write, 0 = write-only. Bounded by
+ the read_data max_size of I2CResult (see interdevice.options); larger
+ requests are truncated, visible in the returned byte count. */
+    uint32_t read_len;
 } meshtastic_I2CTransaction;
 
 /* SD card statistics */
@@ -86,7 +95,7 @@ typedef struct _meshtastic_SdCardInfo {
     uint64_t free_bytes; /* Free bytes */
 } meshtastic_SdCardInfo;
 
-typedef PB_BYTES_ARRAY_T(64) meshtastic_I2CResult_read_data_t;
+typedef PB_BYTES_ARRAY_T(256) meshtastic_I2CResult_read_data_t;
 /* Result of an I2CTransaction */
 typedef struct _meshtastic_I2CResult {
     meshtastic_I2CResult_Status status;
@@ -146,13 +155,13 @@ extern "C" {
 
 /* Initializer values for message structs */
 #define meshtastic_FileTransfer_init_default     {_meshtastic_FileOperation_MIN, "", {0, {0}}, 0, "", 0, 0, 0}
-#define meshtastic_DirectoryListing_init_default {"", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, 0, "", 0, 0}
+#define meshtastic_DirectoryListing_init_default {"", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, 0, "", 0, 0}
 #define meshtastic_I2CTransaction_init_default   {0, {0, {0}}, 0}
 #define meshtastic_SdCardInfo_init_default       {0, _meshtastic_SdCardInfo_CardType_MIN, _meshtastic_SdCardInfo_FatType_MIN, 0, 0, 0}
 #define meshtastic_I2CResult_init_default        {_meshtastic_I2CResult_Status_MIN, {0, {0}}}
 #define meshtastic_InterdeviceMessage_init_default {0, {""}}
 #define meshtastic_FileTransfer_init_zero        {_meshtastic_FileOperation_MIN, "", {0, {0}}, 0, "", 0, 0, 0}
-#define meshtastic_DirectoryListing_init_zero    {"", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, 0, "", 0, 0}
+#define meshtastic_DirectoryListing_init_zero    {"", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, 0, "", 0, 0}
 #define meshtastic_I2CTransaction_init_zero      {0, {0, {0}}, 0}
 #define meshtastic_SdCardInfo_init_zero          {0, _meshtastic_SdCardInfo_CardType_MIN, _meshtastic_SdCardInfo_FatType_MIN, 0, 0, 0}
 #define meshtastic_I2CResult_init_zero           {_meshtastic_I2CResult_Status_MIN, {0, {0}}}
@@ -202,9 +211,9 @@ X(a, STATIC,   SINGULAR, STRING,   filepath,          2) \
 X(a, STATIC,   SINGULAR, BYTES,    filedata,          3) \
 X(a, STATIC,   SINGULAR, BOOL,     success,           4) \
 X(a, STATIC,   SINGULAR, STRING,   message,           5) \
-X(a, STATIC,   SINGULAR, UINT32,   offset,            6) \
+X(a, STATIC,   SINGULAR, UINT64,   offset,            6) \
 X(a, STATIC,   SINGULAR, UINT32,   length,            7) \
-X(a, STATIC,   SINGULAR, UINT32,   file_size,         8)
+X(a, STATIC,   SINGULAR, UINT64,   file_size,         8)
 #define meshtastic_FileTransfer_CALLBACK NULL
 #define meshtastic_FileTransfer_DEFAULT NULL
 
@@ -277,11 +286,11 @@ extern const pb_msgdesc_t meshtastic_InterdeviceMessage_msg;
 
 /* Maximum encoded size of messages (where known) */
 #define MESHTASTIC_MESHTASTIC_INTERDEVICE_PB_H_MAX_SIZE meshtastic_InterdeviceMessage_size
-#define meshtastic_DirectoryListing_size         1872
-#define meshtastic_FileTransfer_size             4635
-#define meshtastic_I2CResult_size                68
-#define meshtastic_I2CTransaction_size           78
-#define meshtastic_InterdeviceMessage_size       4638
+#define meshtastic_DirectoryListing_size         4656
+#define meshtastic_FileTransfer_size             4645
+#define meshtastic_I2CResult_size                261
+#define meshtastic_I2CTransaction_size           271
+#define meshtastic_InterdeviceMessage_size       4659
 #define meshtastic_SdCardInfo_size               39
 
 #ifdef __cplusplus

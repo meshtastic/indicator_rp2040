@@ -155,7 +155,12 @@ bool mt_handle_packet(size_t payload_len) {
       size_t want = request.length;
       if (want == 0 || want > sizeof(out->filedata.bytes))
         want = sizeof(out->filedata.bytes);
-      if (!read_cache.seek(request.offset)) {
+      if (request.offset > 0xFFFFFFFFull) {
+        // the FS layer seeks with 32 bit positions
+        strncpy(out->message, "offset too large", sizeof(out->message) - 1);
+        break;
+      }
+      if (!read_cache.seek((uint32_t)request.offset)) {
         strncpy(out->message, "seek failed", sizeof(out->message) - 1);
         break;
       }
