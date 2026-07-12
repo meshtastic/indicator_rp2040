@@ -33,7 +33,7 @@ static void check_sd_generation() {
 // it's global, we have to make sure we're only ever doing one encoding or
 // decoding at a time.
 
-#define PB_BUFSIZE meshtastic_InterdeviceMessage_size + MT_HEADER_SIZE
+#define PB_BUFSIZE (meshtastic_InterdeviceMessage_size + MT_HEADER_SIZE)
 
 pb_byte_t pb_rx_buf[PB_BUFSIZE];
 size_t pb_rx_size = 0; // Number of bytes currently in the buffer
@@ -164,6 +164,12 @@ bool mt_handle_packet(size_t payload_len) {
         read_cache = SD.open(request.filepath, FILE_READ);
         if (!read_cache) {
           strncpy(out->message, "open failed", sizeof(out->message) - 1);
+          break;
+        }
+        if (read_cache.isDirectory()) {
+          // reading one returns raw directory entries, not file content
+          invalidate_read_cache();
+          strncpy(out->message, "not a file", sizeof(out->message) - 1);
           break;
         }
         strncpy(read_cache_path, request.filepath, sizeof(read_cache_path) - 1);
@@ -346,6 +352,12 @@ bool mt_handle_packet(size_t payload_len) {
         response.data.i2c_scan_result
             .bytes[response.data.i2c_scan_result.size++] = addr;
     }
+    // a stuck-low SDA acks every probe; report a fault as an empty scan
+    // rather than 112 phantom devices
+    if (response.data.i2c_scan_result.size >= 100) {
+      Serial.println("I2C scan: bus fault, every address responded");
+      response.data.i2c_scan_result.size = 0;
+    }
     return mt_send_uplink(response);
   }
 
@@ -356,35 +368,37 @@ bool mt_handle_packet(size_t payload_len) {
   }
 }
 
+// Distance to the next byte that could start a frame. Skips the corrupt
+// prefix while keeping anything that may be a frame queued behind it (a
+// trailing lone MT_MAGIC_0 counts, its successor has not arrived yet).
+static size_t scan_magic(const pb_byte_t *buf, size_t len) {
+  for (size_t i = 1; i < len; i++) {
+    if (buf[i] == MT_MAGIC_0 && (i + 1 == len || buf[i + 1] == MT_MAGIC_1))
+      return i;
+  }
+  return len;
+}
+
 void mt_check_packet() {
-  if (pb_rx_size < MT_HEADER_SIZE) {
-    // We don't even have a header yet
-    return;
-  }
+  // process everything buffered; one pass can deliver several frames
+  while (pb_rx_size >= MT_HEADER_SIZE) {
+    size_t payload_len = (size_t)(pb_rx_buf[2] << 8 | pb_rx_buf[3]);
+    if (pb_rx_buf[0] != MT_MAGIC_0 || pb_rx_buf[1] != MT_MAGIC_1 ||
+        payload_len + MT_HEADER_SIZE > PB_BUFSIZE) {
+      // Corrupt or false header: resync on the next magic instead of
+      // flushing, one bad byte must not cost the frames behind it
+      size_t skip = scan_magic(pb_rx_buf, pb_rx_size);
+      Serial.printf("Bad frame header, dropping %u bytes\r\n", (unsigned)skip);
+      memmove(pb_rx_buf, pb_rx_buf + skip, pb_rx_size - skip);
+      pb_rx_size -= skip;
+      continue;
+    }
 
-  if (pb_rx_buf[0] != MT_MAGIC_0 || pb_rx_buf[1] != MT_MAGIC_1) {
-    Serial.println("Got bad magic");
-    memset(pb_rx_buf, 0, PB_BUFSIZE);
-    pb_rx_size = 0;
-    return;
-  }
+    if (payload_len + MT_HEADER_SIZE > pb_rx_size)
+      return; // frame not complete yet
 
-  uint16_t payload_len = pb_rx_buf[2] << 8 | pb_rx_buf[3];
-  if ((size_t)payload_len + MT_HEADER_SIZE > PB_BUFSIZE) {
-    // oversized frame can never complete, resync on the next magic
-    Serial.println("Got packet claiming to be ridiculous length");
-    memset(pb_rx_buf, 0, PB_BUFSIZE);
-    pb_rx_size = 0;
-    return;
+    mt_handle_packet(payload_len);
   }
-
-  if ((size_t)(payload_len + MT_HEADER_SIZE) > pb_rx_size) {
-    // Packet not complete yet
-    return;
-  }
-
-  // We have a complete packet, handle it
-  mt_handle_packet(payload_len);
 }
 
 size_t mt_serial_check(char *buf, size_t space_left) {
@@ -399,8 +413,8 @@ bool mt_send_uplink(const meshtastic_InterdeviceMessage &message) {
   pb_tx_buf[0] = MT_MAGIC_0;
   pb_tx_buf[1] = MT_MAGIC_1;
 
-  pb_ostream_t stream =
-      pb_ostream_from_buffer(pb_tx_buf + MT_HEADER_SIZE, PB_BUFSIZE);
+  pb_ostream_t stream = pb_ostream_from_buffer(pb_tx_buf + MT_HEADER_SIZE,
+                                               PB_BUFSIZE - MT_HEADER_SIZE);
   if (!pb_encode(&stream, meshtastic_InterdeviceMessage_fields, &message)) {
     Serial.println("pb_encode failed");
     return false;
@@ -418,6 +432,10 @@ bool mt_send_uplink(const meshtastic_InterdeviceMessage &message) {
 
 void mt_loop() {
   size_t bytes_read = 0;
+
+  // byte loss is otherwise invisible: it surfaces as a resync much later
+  if (Serial1.overflow())
+    Serial.println("Serial1 RX overflow, frames lost");
 
   // See if there are any more bytes to add to our buffer.
   size_t space_left = PB_BUFSIZE - pb_rx_size;

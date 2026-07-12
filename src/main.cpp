@@ -89,6 +89,7 @@ void sd_get_info(meshtastic_SdCardInfo *out) {
     if (sd_stats_valid) {
       out->used_bytes = sd_used_bytes;
       out->free_bytes = sd_free_bytes;
+      out->stats_valid = true;
     }
     mutex_exit(&sd_mutex);
   }
@@ -263,11 +264,19 @@ void setup() {
 
   Serial.printf(SENSECAP, VERSION);
   beep_on(50);
+
+  // This MCU is the sole path to GPS, sensors and SD card; a wedged
+  // peripheral driver must reboot it rather than take them down for good.
+  // The request loop on core0 feeds the watchdog, core1 may block freely.
+  rp2040.wdt_begin(4000);
 }
 
 void loop() {
 
-  if (buzz_off > 0 && millis() > buzz_off) {
+  // watchdog: this loop must never stall, all blocking work is on core1
+  rp2040.wdt_reset();
+
+  if (buzz_off != 0 && (int32_t)(millis() - buzz_off) >= 0) {
     beep_off();
     buzz_off = 0;
   }
