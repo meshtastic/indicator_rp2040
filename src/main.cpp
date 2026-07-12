@@ -59,16 +59,21 @@ bool sd_ensure(void) {
   return true;
 }
 
-// runs from loop(), outside the request path
+// runs from loop(), outside the request path; retries rate-limited on
+// transient SDFS.info failures
 void sd_update_stats(void) {
+  static uint32_t last_attempt = 0;
   if (!sd_stats_pending || !sd_init_flag)
     return;
-  sd_stats_pending = false;
+  if (last_attempt != 0 && millis() - last_attempt < 5000)
+    return;
+  last_attempt = millis();
   FSInfo info;
   if (SDFS.info(info)) {
     sd_used_bytes = info.usedBytes;
     sd_free_bytes = info.totalBytes - info.usedBytes;
     sd_stats_valid = true;
+    sd_stats_pending = false;
   }
 }
 
@@ -116,6 +121,8 @@ void setup() {
   Wire.setSDA(20);
   Wire.setSCL(21);
   Wire.begin();
+  // a hung bus must not stall the executor, reset it on timeout
+  Wire.setTimeout(50, true);
 
   // SD Card slot is on SPI1
   SPI1.setSCK(10);
