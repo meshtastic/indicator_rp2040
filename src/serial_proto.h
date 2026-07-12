@@ -18,15 +18,8 @@
 // Wait this many msec if there's nothing new on the channel
 #define NO_NEWS_PAUSE 25
 
-bool mt_send_uplink(meshtastic_InterdeviceMessage message);
-
-// Set the callback function that gets called when the node receives a sensor
-// control message.
-void mt_set_sensor_callback(void (*callback)(meshtastic_SensorData sensor));
-
-// Set callback function that gets called when nmea message is received
+bool mt_send_uplink(const meshtastic_InterdeviceMessage &message);
 void mt_set_nmea_callback(void (*callback)(char *nmea));
-
 void mt_loop();
 
 #endif

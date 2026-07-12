@@ -10,104 +10,279 @@
 #endif
 
 /* Enum definitions */
-typedef enum _meshtastic_MessageType {
-  meshtastic_MessageType_ACK = 0,
-  meshtastic_MessageType_COLLECT_INTERVAL = 160, /* in ms */
-  meshtastic_MessageType_BEEP_ON = 161,          /* duration ms */
-  meshtastic_MessageType_BEEP_OFF = 162,         /* cancel prematurely */
-  meshtastic_MessageType_SHUTDOWN = 163,
-  meshtastic_MessageType_POWER_ON = 164,
-  meshtastic_MessageType_SCD41_TEMP = 176,
-  meshtastic_MessageType_SCD41_HUMIDITY = 177,
-  meshtastic_MessageType_SCD41_CO2 = 178,
-  meshtastic_MessageType_AHT20_TEMP = 179,
-  meshtastic_MessageType_AHT20_HUMIDITY = 180,
-  meshtastic_MessageType_TVOC_INDEX = 181
-} meshtastic_MessageType;
+/* Defines the supported file operations */
+typedef enum _meshtastic_FileOperation {
+    meshtastic_FileOperation_GET = 0,
+    meshtastic_FileOperation_POST = 1,
+    meshtastic_FileOperation_PUT = 2,
+    meshtastic_FileOperation_DELETE = 3
+} meshtastic_FileOperation;
+
+typedef enum _meshtastic_SdCardInfo_CardType {
+    meshtastic_SdCardInfo_CardType_NONE = 0,
+    meshtastic_SdCardInfo_CardType_MMC = 1,
+    meshtastic_SdCardInfo_CardType_SD = 2,
+    meshtastic_SdCardInfo_CardType_SDHC = 3,
+    meshtastic_SdCardInfo_CardType_SDXC = 4,
+    meshtastic_SdCardInfo_CardType_UNKNOWN_CARD = 5
+} meshtastic_SdCardInfo_CardType;
+
+typedef enum _meshtastic_SdCardInfo_FatType {
+    meshtastic_SdCardInfo_FatType_UNKNOWN_FAT = 0,
+    meshtastic_SdCardInfo_FatType_FAT16 = 1,
+    meshtastic_SdCardInfo_FatType_FAT32 = 2,
+    meshtastic_SdCardInfo_FatType_EXFAT = 3
+} meshtastic_SdCardInfo_FatType;
+
+typedef enum _meshtastic_I2CResult_Status {
+    meshtastic_I2CResult_Status_OK = 0,
+    meshtastic_I2CResult_Status_NACK_ADDRESS = 1,
+    meshtastic_I2CResult_Status_NACK_DATA = 2,
+    meshtastic_I2CResult_Status_ERROR = 3
+} meshtastic_I2CResult_Status;
 
 /* Struct definitions */
-typedef struct _meshtastic_SensorData {
-  /* The message type */
-  meshtastic_MessageType type;
-  pb_size_t which_data;
-  union {
-    float float_value;
-    uint32_t uint32_value;
-  } data;
-} meshtastic_SensorData;
+typedef PB_BYTES_ARRAY_T(4096) meshtastic_FileTransfer_filedata_t;
+/* Message for file operations */
+typedef struct _meshtastic_FileTransfer {
+    meshtastic_FileOperation operation; /* File operation (GET, POST, PUT, DELETE) */
+    char filepath[255]; /* Path of the file on the SD card */
+    meshtastic_FileTransfer_filedata_t filedata; /* Chunk content (POST/PUT request, GET response) */
+    bool success; /* Response: Was the operation successful? */
+    char message[255]; /* Response: Status message */
+    uint32_t offset; /* Byte offset of this chunk within the file (ranged GET/PUT) */
+    uint32_t length; /* GET request: number of bytes to read (0 = max chunk size) */
+    uint32_t file_size; /* GET response: total size of the file */
+} meshtastic_FileTransfer;
 
+/* Message for structured directory listing */
+typedef struct _meshtastic_DirectoryListing {
+    char directory[255]; /* Path of the directory */
+    pb_size_t filenames_count;
+    char filenames[32][41]; /* List of file names */
+    bool success; /* Response: Was the operation successful? */
+    char message[255]; /* Response: Status message */
+    uint32_t offset; /* Request: skip this many entries (paging) */
+    uint32_t total_count; /* Response: total number of entries in the directory */
+} meshtastic_DirectoryListing;
+
+typedef PB_BYTES_ARRAY_T(64) meshtastic_I2CTransaction_write_data_t;
+/* A single I2C transaction: an optional write followed by an optional
+ read with repeated start, matching the TwoWire usage of sensor drivers
+ (beginTransmission/write.../endTransmission(false)/requestFrom) */
+typedef struct _meshtastic_I2CTransaction {
+    uint32_t address; /* 7-bit device address */
+    meshtastic_I2CTransaction_write_data_t write_data; /* Bytes to write, may be empty */
+    uint32_t read_len; /* Number of bytes to read after the write, 0 = write-only */
+} meshtastic_I2CTransaction;
+
+/* SD card statistics */
+typedef struct _meshtastic_SdCardInfo {
+    bool present; /* Card initialized and usable */
+    meshtastic_SdCardInfo_CardType card_type;
+    meshtastic_SdCardInfo_FatType fat_type;
+    uint64_t card_size; /* Filesystem size in bytes */
+    uint64_t used_bytes; /* Used bytes (may be expensive to compute on FAT32) */
+    uint64_t free_bytes; /* Free bytes */
+} meshtastic_SdCardInfo;
+
+typedef PB_BYTES_ARRAY_T(64) meshtastic_I2CResult_read_data_t;
+/* Result of an I2CTransaction */
+typedef struct _meshtastic_I2CResult {
+    meshtastic_I2CResult_Status status;
+    meshtastic_I2CResult_read_data_t read_data; /* Data read from the device, empty for write-only transactions */
+} meshtastic_I2CResult;
+
+typedef PB_BYTES_ARRAY_T(128) meshtastic_InterdeviceMessage_i2c_scan_result_t;
+/* Main message for interdevice communication */
 typedef struct _meshtastic_InterdeviceMessage {
-  pb_size_t which_data;
-  union {
-    char nmea[1024];
-    meshtastic_SensorData sensor;
-  } data;
+    pb_size_t which_data;
+    union {
+        char nmea[1024];
+        uint16_t beep;
+        meshtastic_I2CTransaction i2c_transaction;
+        meshtastic_I2CResult i2c_result;
+        bool i2c_scan; /* Request: scan the secondary I2C bus */
+        meshtastic_InterdeviceMessage_i2c_scan_result_t i2c_scan_result; /* Response: 7-bit addresses of discovered devices */
+        meshtastic_FileTransfer file_transfer;
+        meshtastic_DirectoryListing directory_listing;
+        bool get_sd_info; /* Request: SD card statistics */
+        meshtastic_SdCardInfo sd_info; /* Response */
+    } data;
 } meshtastic_InterdeviceMessage;
+
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Helper constants for enums */
-#define _meshtastic_MessageType_MIN meshtastic_MessageType_ACK
-#define _meshtastic_MessageType_MAX meshtastic_MessageType_TVOC_INDEX
-#define _meshtastic_MessageType_ARRAYSIZE                                      \
-  ((meshtastic_MessageType)(meshtastic_MessageType_TVOC_INDEX + 1))
+#define _meshtastic_FileOperation_MIN meshtastic_FileOperation_GET
+#define _meshtastic_FileOperation_MAX meshtastic_FileOperation_DELETE
+#define _meshtastic_FileOperation_ARRAYSIZE ((meshtastic_FileOperation)(meshtastic_FileOperation_DELETE+1))
 
-#define meshtastic_SensorData_type_ENUMTYPE meshtastic_MessageType
+#define _meshtastic_SdCardInfo_CardType_MIN meshtastic_SdCardInfo_CardType_NONE
+#define _meshtastic_SdCardInfo_CardType_MAX meshtastic_SdCardInfo_CardType_UNKNOWN_CARD
+#define _meshtastic_SdCardInfo_CardType_ARRAYSIZE ((meshtastic_SdCardInfo_CardType)(meshtastic_SdCardInfo_CardType_UNKNOWN_CARD+1))
+
+#define _meshtastic_SdCardInfo_FatType_MIN meshtastic_SdCardInfo_FatType_UNKNOWN_FAT
+#define _meshtastic_SdCardInfo_FatType_MAX meshtastic_SdCardInfo_FatType_EXFAT
+#define _meshtastic_SdCardInfo_FatType_ARRAYSIZE ((meshtastic_SdCardInfo_FatType)(meshtastic_SdCardInfo_FatType_EXFAT+1))
+
+#define _meshtastic_I2CResult_Status_MIN meshtastic_I2CResult_Status_OK
+#define _meshtastic_I2CResult_Status_MAX meshtastic_I2CResult_Status_ERROR
+#define _meshtastic_I2CResult_Status_ARRAYSIZE ((meshtastic_I2CResult_Status)(meshtastic_I2CResult_Status_ERROR+1))
+
+#define meshtastic_FileTransfer_operation_ENUMTYPE meshtastic_FileOperation
+
+
+
+#define meshtastic_SdCardInfo_card_type_ENUMTYPE meshtastic_SdCardInfo_CardType
+#define meshtastic_SdCardInfo_fat_type_ENUMTYPE meshtastic_SdCardInfo_FatType
+
+#define meshtastic_I2CResult_status_ENUMTYPE meshtastic_I2CResult_Status
+
+
 
 /* Initializer values for message structs */
-#define meshtastic_SensorData_init_default                                     \
-  {                                                                            \
-    _meshtastic_MessageType_MIN, 0, { 0 }                                      \
-  }
-#define meshtastic_InterdeviceMessage_init_default                             \
-  {                                                                            \
-    0, { "" }                                                                  \
-  }
-#define meshtastic_SensorData_init_zero                                        \
-  {                                                                            \
-    _meshtastic_MessageType_MIN, 0, { 0 }                                      \
-  }
-#define meshtastic_InterdeviceMessage_init_zero                                \
-  {                                                                            \
-    0, { "" }                                                                  \
-  }
+#define meshtastic_FileTransfer_init_default     {_meshtastic_FileOperation_MIN, "", {0, {0}}, 0, "", 0, 0, 0}
+#define meshtastic_DirectoryListing_init_default {"", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, 0, "", 0, 0}
+#define meshtastic_I2CTransaction_init_default   {0, {0, {0}}, 0}
+#define meshtastic_SdCardInfo_init_default       {0, _meshtastic_SdCardInfo_CardType_MIN, _meshtastic_SdCardInfo_FatType_MIN, 0, 0, 0}
+#define meshtastic_I2CResult_init_default        {_meshtastic_I2CResult_Status_MIN, {0, {0}}}
+#define meshtastic_InterdeviceMessage_init_default {0, {""}}
+#define meshtastic_FileTransfer_init_zero        {_meshtastic_FileOperation_MIN, "", {0, {0}}, 0, "", 0, 0, 0}
+#define meshtastic_DirectoryListing_init_zero    {"", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, 0, "", 0, 0}
+#define meshtastic_I2CTransaction_init_zero      {0, {0, {0}}, 0}
+#define meshtastic_SdCardInfo_init_zero          {0, _meshtastic_SdCardInfo_CardType_MIN, _meshtastic_SdCardInfo_FatType_MIN, 0, 0, 0}
+#define meshtastic_I2CResult_init_zero           {_meshtastic_I2CResult_Status_MIN, {0, {0}}}
+#define meshtastic_InterdeviceMessage_init_zero  {0, {""}}
 
 /* Field tags (for use in manual encoding/decoding) */
-#define meshtastic_SensorData_type_tag 1
-#define meshtastic_SensorData_float_value_tag 2
-#define meshtastic_SensorData_uint32_value_tag 3
-#define meshtastic_InterdeviceMessage_nmea_tag 1
-#define meshtastic_InterdeviceMessage_sensor_tag 2
+#define meshtastic_FileTransfer_operation_tag    1
+#define meshtastic_FileTransfer_filepath_tag     2
+#define meshtastic_FileTransfer_filedata_tag     3
+#define meshtastic_FileTransfer_success_tag      4
+#define meshtastic_FileTransfer_message_tag      5
+#define meshtastic_FileTransfer_offset_tag       6
+#define meshtastic_FileTransfer_length_tag       7
+#define meshtastic_FileTransfer_file_size_tag    8
+#define meshtastic_DirectoryListing_directory_tag 1
+#define meshtastic_DirectoryListing_filenames_tag 2
+#define meshtastic_DirectoryListing_success_tag  3
+#define meshtastic_DirectoryListing_message_tag  4
+#define meshtastic_DirectoryListing_offset_tag   5
+#define meshtastic_DirectoryListing_total_count_tag 6
+#define meshtastic_I2CTransaction_address_tag    1
+#define meshtastic_I2CTransaction_write_data_tag 2
+#define meshtastic_I2CTransaction_read_len_tag   3
+#define meshtastic_SdCardInfo_present_tag        1
+#define meshtastic_SdCardInfo_card_type_tag      2
+#define meshtastic_SdCardInfo_fat_type_tag       3
+#define meshtastic_SdCardInfo_card_size_tag      4
+#define meshtastic_SdCardInfo_used_bytes_tag     5
+#define meshtastic_SdCardInfo_free_bytes_tag     6
+#define meshtastic_I2CResult_status_tag          1
+#define meshtastic_I2CResult_read_data_tag       2
+#define meshtastic_InterdeviceMessage_nmea_tag   1
+#define meshtastic_InterdeviceMessage_beep_tag   2
+#define meshtastic_InterdeviceMessage_i2c_transaction_tag 3
+#define meshtastic_InterdeviceMessage_i2c_result_tag 4
+#define meshtastic_InterdeviceMessage_i2c_scan_tag 5
+#define meshtastic_InterdeviceMessage_i2c_scan_result_tag 6
+#define meshtastic_InterdeviceMessage_file_transfer_tag 7
+#define meshtastic_InterdeviceMessage_directory_listing_tag 8
+#define meshtastic_InterdeviceMessage_get_sd_info_tag 9
+#define meshtastic_InterdeviceMessage_sd_info_tag 10
 
 /* Struct field encoding specification for nanopb */
-#define meshtastic_SensorData_FIELDLIST(X, a)                                  \
-  X(a, STATIC, SINGULAR, UENUM, type, 1)                                       \
-  X(a, STATIC, ONEOF, FLOAT, (data, float_value, data.float_value), 2)         \
-  X(a, STATIC, ONEOF, UINT32, (data, uint32_value, data.uint32_value), 3)
-#define meshtastic_SensorData_CALLBACK NULL
-#define meshtastic_SensorData_DEFAULT NULL
+#define meshtastic_FileTransfer_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UENUM,    operation,         1) \
+X(a, STATIC,   SINGULAR, STRING,   filepath,          2) \
+X(a, STATIC,   SINGULAR, BYTES,    filedata,          3) \
+X(a, STATIC,   SINGULAR, BOOL,     success,           4) \
+X(a, STATIC,   SINGULAR, STRING,   message,           5) \
+X(a, STATIC,   SINGULAR, UINT32,   offset,            6) \
+X(a, STATIC,   SINGULAR, UINT32,   length,            7) \
+X(a, STATIC,   SINGULAR, UINT32,   file_size,         8)
+#define meshtastic_FileTransfer_CALLBACK NULL
+#define meshtastic_FileTransfer_DEFAULT NULL
 
-#define meshtastic_InterdeviceMessage_FIELDLIST(X, a)                          \
-  X(a, STATIC, ONEOF, STRING, (data, nmea, data.nmea), 1)                      \
-  X(a, STATIC, ONEOF, MESSAGE, (data, sensor, data.sensor), 2)
+#define meshtastic_DirectoryListing_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, STRING,   directory,         1) \
+X(a, STATIC,   REPEATED, STRING,   filenames,         2) \
+X(a, STATIC,   SINGULAR, BOOL,     success,           3) \
+X(a, STATIC,   SINGULAR, STRING,   message,           4) \
+X(a, STATIC,   SINGULAR, UINT32,   offset,            5) \
+X(a, STATIC,   SINGULAR, UINT32,   total_count,       6)
+#define meshtastic_DirectoryListing_CALLBACK NULL
+#define meshtastic_DirectoryListing_DEFAULT NULL
+
+#define meshtastic_I2CTransaction_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UINT32,   address,           1) \
+X(a, STATIC,   SINGULAR, BYTES,    write_data,        2) \
+X(a, STATIC,   SINGULAR, UINT32,   read_len,          3)
+#define meshtastic_I2CTransaction_CALLBACK NULL
+#define meshtastic_I2CTransaction_DEFAULT NULL
+
+#define meshtastic_SdCardInfo_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     present,           1) \
+X(a, STATIC,   SINGULAR, UENUM,    card_type,         2) \
+X(a, STATIC,   SINGULAR, UENUM,    fat_type,          3) \
+X(a, STATIC,   SINGULAR, UINT64,   card_size,         4) \
+X(a, STATIC,   SINGULAR, UINT64,   used_bytes,        5) \
+X(a, STATIC,   SINGULAR, UINT64,   free_bytes,        6)
+#define meshtastic_SdCardInfo_CALLBACK NULL
+#define meshtastic_SdCardInfo_DEFAULT NULL
+
+#define meshtastic_I2CResult_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UENUM,    status,            1) \
+X(a, STATIC,   SINGULAR, BYTES,    read_data,         2)
+#define meshtastic_I2CResult_CALLBACK NULL
+#define meshtastic_I2CResult_DEFAULT NULL
+
+#define meshtastic_InterdeviceMessage_FIELDLIST(X, a) \
+X(a, STATIC,   ONEOF,    STRING,   (data,nmea,data.nmea),   1) \
+X(a, STATIC,   ONEOF,    UINT32,   (data,beep,data.beep),   2) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (data,i2c_transaction,data.i2c_transaction),   3) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (data,i2c_result,data.i2c_result),   4) \
+X(a, STATIC,   ONEOF,    BOOL,     (data,i2c_scan,data.i2c_scan),   5) \
+X(a, STATIC,   ONEOF,    BYTES,    (data,i2c_scan_result,data.i2c_scan_result),   6) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (data,file_transfer,data.file_transfer),   7) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (data,directory_listing,data.directory_listing),   8) \
+X(a, STATIC,   ONEOF,    BOOL,     (data,get_sd_info,data.get_sd_info),   9) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (data,sd_info,data.sd_info),  10)
 #define meshtastic_InterdeviceMessage_CALLBACK NULL
 #define meshtastic_InterdeviceMessage_DEFAULT NULL
-#define meshtastic_InterdeviceMessage_data_sensor_MSGTYPE meshtastic_SensorData
+#define meshtastic_InterdeviceMessage_data_i2c_transaction_MSGTYPE meshtastic_I2CTransaction
+#define meshtastic_InterdeviceMessage_data_i2c_result_MSGTYPE meshtastic_I2CResult
+#define meshtastic_InterdeviceMessage_data_file_transfer_MSGTYPE meshtastic_FileTransfer
+#define meshtastic_InterdeviceMessage_data_directory_listing_MSGTYPE meshtastic_DirectoryListing
+#define meshtastic_InterdeviceMessage_data_sd_info_MSGTYPE meshtastic_SdCardInfo
 
-extern const pb_msgdesc_t meshtastic_SensorData_msg;
+extern const pb_msgdesc_t meshtastic_FileTransfer_msg;
+extern const pb_msgdesc_t meshtastic_DirectoryListing_msg;
+extern const pb_msgdesc_t meshtastic_I2CTransaction_msg;
+extern const pb_msgdesc_t meshtastic_SdCardInfo_msg;
+extern const pb_msgdesc_t meshtastic_I2CResult_msg;
 extern const pb_msgdesc_t meshtastic_InterdeviceMessage_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
-#define meshtastic_SensorData_fields &meshtastic_SensorData_msg
+#define meshtastic_FileTransfer_fields &meshtastic_FileTransfer_msg
+#define meshtastic_DirectoryListing_fields &meshtastic_DirectoryListing_msg
+#define meshtastic_I2CTransaction_fields &meshtastic_I2CTransaction_msg
+#define meshtastic_SdCardInfo_fields &meshtastic_SdCardInfo_msg
+#define meshtastic_I2CResult_fields &meshtastic_I2CResult_msg
 #define meshtastic_InterdeviceMessage_fields &meshtastic_InterdeviceMessage_msg
 
 /* Maximum encoded size of messages (where known) */
-#define MESHTASTIC_MESHTASTIC_INTERDEVICE_PB_H_MAX_SIZE                        \
-  meshtastic_InterdeviceMessage_size
-#define meshtastic_InterdeviceMessage_size 1026
-#define meshtastic_SensorData_size 9
+#define MESHTASTIC_MESHTASTIC_INTERDEVICE_PB_H_MAX_SIZE meshtastic_InterdeviceMessage_size
+#define meshtastic_DirectoryListing_size         1872
+#define meshtastic_FileTransfer_size             4635
+#define meshtastic_I2CResult_size                68
+#define meshtastic_I2CTransaction_size           78
+#define meshtastic_InterdeviceMessage_size       4638
+#define meshtastic_SdCardInfo_size               39
 
 #ifdef __cplusplus
 } /* extern "C" */
