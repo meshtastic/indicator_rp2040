@@ -85,6 +85,7 @@ bool mt_handle_packet(size_t payload_len) {
     meshtastic_I2CTransaction transaction = message.data.i2c_transaction;
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
+    response.id = message.id; // correlate with the request
     response.which_data = meshtastic_InterdeviceMessage_i2c_result_tag;
     meshtastic_I2CResult *result = &response.data.i2c_result;
     result->status = meshtastic_I2CResult_Status_OK;
@@ -128,6 +129,7 @@ bool mt_handle_packet(size_t payload_len) {
     meshtastic_FileTransfer &request = message.data.file_transfer;
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
+    response.id = message.id; // correlate with the request
     response.which_data = meshtastic_InterdeviceMessage_file_transfer_tag;
     meshtastic_FileTransfer *out = &response.data.file_transfer;
     out->operation = request.operation;
@@ -220,6 +222,7 @@ bool mt_handle_packet(size_t payload_len) {
     meshtastic_DirectoryListing &request = message.data.directory_listing;
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
+    response.id = message.id; // correlate with the request
     response.which_data = meshtastic_InterdeviceMessage_directory_listing_tag;
     meshtastic_DirectoryListing *out = &response.data.directory_listing;
     strncpy(out->directory, request.directory, sizeof(out->directory) - 1);
@@ -264,6 +267,7 @@ bool mt_handle_packet(size_t payload_len) {
     // FAT16/32 cards, which can take a while on the first call.
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
+    response.id = message.id; // correlate with the request
     response.which_data = meshtastic_InterdeviceMessage_sd_info_tag;
     meshtastic_SdCardInfo *info = &response.data.sd_info;
 
@@ -310,6 +314,7 @@ bool mt_handle_packet(size_t payload_len) {
     // Scan the local bus and report all responding addresses
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
+    response.id = message.id; // correlate with the request
     response.which_data = meshtastic_InterdeviceMessage_i2c_scan_result_tag;
     for (uint8_t addr = 8; addr < 120; addr++) {
       if (response.data.i2c_scan_result.size >=
@@ -344,8 +349,11 @@ void mt_check_packet() {
   }
 
   uint16_t payload_len = pb_rx_buf[2] << 8 | pb_rx_buf[3];
-  if (payload_len > PB_BUFSIZE) {
+  if ((size_t)payload_len + MT_HEADER_SIZE > PB_BUFSIZE) {
+    // oversized frame can never complete, resync on the next magic
     Serial.println("Got packet claiming to be ridiculous length");
+    memset(pb_rx_buf, 0, PB_BUFSIZE);
+    pb_rx_size = 0;
     return;
   }
 
@@ -360,13 +368,8 @@ void mt_check_packet() {
 
 size_t mt_serial_check(char *buf, size_t space_left) {
   size_t bytes_read = 0;
-  while (Serial1.available()) {
-    char c = Serial1.read();
-    *buf++ = c;
-    if (++bytes_read >= space_left) {
-      Serial.println("Serial overflow");
-      break;
-    }
+  while (bytes_read < space_left && Serial1.available()) {
+    buf[bytes_read++] = Serial1.read();
   }
   return bytes_read;
 }

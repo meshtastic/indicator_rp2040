@@ -118,6 +118,9 @@ typedef struct _meshtastic_InterdeviceMessage {
         bool get_sd_info; /* Request: SD card statistics */
         meshtastic_SdCardInfo sd_info; /* Response */
     } data;
+    /* Correlates a response with its request: responses echo the id of the
+ request they answer. 0 for unsolicited messages (e.g. the nmea stream). */
+    uint32_t id;
 } meshtastic_InterdeviceMessage;
 
 
@@ -159,13 +162,13 @@ extern "C" {
 #define meshtastic_I2CTransaction_init_default   {0, {0, {0}}, 0}
 #define meshtastic_SdCardInfo_init_default       {0, _meshtastic_SdCardInfo_CardType_MIN, _meshtastic_SdCardInfo_FatType_MIN, 0, 0, 0}
 #define meshtastic_I2CResult_init_default        {_meshtastic_I2CResult_Status_MIN, {0, {0}}}
-#define meshtastic_InterdeviceMessage_init_default {0, {""}}
+#define meshtastic_InterdeviceMessage_init_default {0, {""}, 0}
 #define meshtastic_FileTransfer_init_zero        {_meshtastic_FileOperation_MIN, "", {0, {0}}, 0, "", 0, 0, 0}
 #define meshtastic_DirectoryListing_init_zero    {"", 0, {"", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}, 0, "", 0, 0}
 #define meshtastic_I2CTransaction_init_zero      {0, {0, {0}}, 0}
 #define meshtastic_SdCardInfo_init_zero          {0, _meshtastic_SdCardInfo_CardType_MIN, _meshtastic_SdCardInfo_FatType_MIN, 0, 0, 0}
 #define meshtastic_I2CResult_init_zero           {_meshtastic_I2CResult_Status_MIN, {0, {0}}}
-#define meshtastic_InterdeviceMessage_init_zero  {0, {""}}
+#define meshtastic_InterdeviceMessage_init_zero  {0, {""}, 0}
 
 /* Field tags (for use in manual encoding/decoding) */
 #define meshtastic_FileTransfer_operation_tag    1
@@ -203,6 +206,7 @@ extern "C" {
 #define meshtastic_InterdeviceMessage_directory_listing_tag 8
 #define meshtastic_InterdeviceMessage_get_sd_info_tag 9
 #define meshtastic_InterdeviceMessage_sd_info_tag 10
+#define meshtastic_InterdeviceMessage_id_tag     15
 
 /* Struct field encoding specification for nanopb */
 #define meshtastic_FileTransfer_FIELDLIST(X, a) \
@@ -260,7 +264,8 @@ X(a, STATIC,   ONEOF,    BYTES,    (data,i2c_scan_result,data.i2c_scan_result), 
 X(a, STATIC,   ONEOF,    MESSAGE,  (data,file_transfer,data.file_transfer),   7) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (data,directory_listing,data.directory_listing),   8) \
 X(a, STATIC,   ONEOF,    BOOL,     (data,get_sd_info,data.get_sd_info),   9) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (data,sd_info,data.sd_info),  10)
+X(a, STATIC,   ONEOF,    MESSAGE,  (data,sd_info,data.sd_info),  10) \
+X(a, STATIC,   SINGULAR, UINT32,   id,               15)
 #define meshtastic_InterdeviceMessage_CALLBACK NULL
 #define meshtastic_InterdeviceMessage_DEFAULT NULL
 #define meshtastic_InterdeviceMessage_data_i2c_transaction_MSGTYPE meshtastic_I2CTransaction
@@ -290,7 +295,7 @@ extern const pb_msgdesc_t meshtastic_InterdeviceMessage_msg;
 #define meshtastic_FileTransfer_size             4645
 #define meshtastic_I2CResult_size                261
 #define meshtastic_I2CTransaction_size           271
-#define meshtastic_InterdeviceMessage_size       4659
+#define meshtastic_InterdeviceMessage_size       4665
 #define meshtastic_SdCardInfo_size               39
 
 #ifdef __cplusplus
