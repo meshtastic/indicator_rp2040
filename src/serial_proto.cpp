@@ -3,18 +3,30 @@
 #include <SD.h>
 #include <Wire.h>
 
-extern bool sd_ensure(void);
-extern bool sd_used_free(uint64_t *used, uint64_t *free_bytes);
-
 // One-entry read cache: map tiles are fetched in sequential 4K chunks, so
 // keeping the file open between chunks avoids a FAT open + seek per chunk
 static File read_cache;
 static char read_cache_path[256] = "";
 
+// Directory entry count from the last full walk, so follow-up pages of the
+// same listing don't have to walk to the end of the directory again
+static char count_cache_path[256] = "";
+static uint32_t count_cache_total = 0;
+
 static void invalidate_read_cache() {
   if (read_cache)
     read_cache.close();
   read_cache_path[0] = '\0';
+}
+
+// call before any card access: file handles do not survive a remount
+static void check_sd_generation() {
+  static uint32_t seen_generation = 0;
+  if (seen_generation != sd_generation) {
+    invalidate_read_cache();
+    count_cache_path[0] = '\0';
+    seen_generation = sd_generation;
+  }
 }
 
 // The buffer used for protobuf encoding/decoding. Since there's only one, and
@@ -137,10 +149,13 @@ bool mt_handle_packet(size_t payload_len) {
     out->offset = request.offset;
     out->success = false;
 
-    if (!sd_ensure()) {
-      strncpy(out->message, "no SD card", sizeof(out->message) - 1);
+    int claim = sd_claim();
+    if (claim != SD_CLAIM_OK) {
+      strncpy(out->message, claim == SD_CLAIM_BUSY ? "SD busy" : "no SD card",
+              sizeof(out->message) - 1);
       return mt_send_uplink(response);
     }
+    check_sd_generation();
 
     switch (request.operation) {
     case meshtastic_FileOperation_GET: {
@@ -151,8 +166,7 @@ bool mt_handle_packet(size_t payload_len) {
           strncpy(out->message, "open failed", sizeof(out->message) - 1);
           break;
         }
-        strncpy(read_cache_path, request.filepath,
-                sizeof(read_cache_path) - 1);
+        strncpy(read_cache_path, request.filepath, sizeof(read_cache_path) - 1);
       }
       out->file_size = read_cache.size();
       size_t want = request.length;
@@ -165,11 +179,13 @@ bool mt_handle_packet(size_t payload_len) {
       }
       if (!read_cache.seek((uint32_t)request.offset)) {
         strncpy(out->message, "seek failed", sizeof(out->message) - 1);
+        sd_mark_dead(); // seek on an open handle only fails at card level
         break;
       }
       int got = read_cache.read(out->filedata.bytes, want);
       if (got < 0) {
         strncpy(out->message, "read failed", sizeof(out->message) - 1);
+        sd_mark_dead();
         break;
       }
       out->filedata.size = got;
@@ -186,12 +202,16 @@ bool mt_handle_packet(size_t payload_len) {
       File f = SD.open(request.filepath, FILE_WRITE); // append mode, creates
       if (!f) {
         strncpy(out->message, "open failed", sizeof(out->message) - 1);
+        // creating a file on a healthy card does not fail; assume the
+        // card was pulled and let core1 verify with a remount
+        sd_mark_dead();
         break;
       }
       if (f.size() != request.offset) {
         snprintf(out->message, sizeof(out->message),
                  "bad offset %u, file size %u", (unsigned)request.offset,
                  (unsigned)f.size());
+        out->file_size = f.size(); // lets the client resync its offset
         f.close();
         break;
       }
@@ -199,8 +219,13 @@ bool mt_handle_packet(size_t payload_len) {
       out->file_size = f.size();
       f.close();
       out->success = (wrote == request.filedata.size);
-      if (!out->success)
+      if (!out->success) {
         strncpy(out->message, "write failed", sizeof(out->message) - 1);
+        sd_mark_dead();
+      } else {
+        sd_note_write();
+      }
+      count_cache_path[0] = '\0';
       break;
     }
 
@@ -209,11 +234,15 @@ bool mt_handle_packet(size_t payload_len) {
       out->success = SD.remove(request.filepath);
       if (!out->success)
         strncpy(out->message, "remove failed", sizeof(out->message) - 1);
+      else
+        sd_note_write();
+      count_cache_path[0] = '\0';
       break;
 
     default:
       strncpy(out->message, "unknown operation", sizeof(out->message) - 1);
     }
+    sd_release();
     return mt_send_uplink(response);
   }
 
@@ -229,10 +258,13 @@ bool mt_handle_packet(size_t payload_len) {
     out->offset = request.offset;
     out->success = false;
 
-    if (!sd_ensure()) {
-      strncpy(out->message, "no SD card", sizeof(out->message) - 1);
+    int claim = sd_claim();
+    if (claim != SD_CLAIM_OK) {
+      strncpy(out->message, claim == SD_CLAIM_BUSY ? "SD busy" : "no SD card",
+              sizeof(out->message) - 1);
       return mt_send_uplink(response);
     }
+    check_sd_generation();
 
     File dir = SD.open(request.directory);
     if (!dir || !dir.isDirectory()) {
@@ -240,6 +272,11 @@ bool mt_handle_packet(size_t payload_len) {
     } else {
       const size_t max_names =
           sizeof(out->filenames) / sizeof(out->filenames[0]);
+      // Walking to the end of the directory just to count the entries is
+      // expensive (a full LFN-parsing walk per page); do it once on the
+      // first page and reuse the count for the follow-up pages
+      bool have_total = request.offset > 0 &&
+                        strcmp(count_cache_path, request.directory) == 0;
       uint32_t index = 0;
       while (true) {
         File entry = dir.openNextFile();
@@ -253,60 +290,44 @@ bool mt_handle_packet(size_t payload_len) {
         }
         index++;
         entry.close();
+        if (have_total && out->filenames_count >= max_names)
+          break; // page full, the total is already known
       }
-      out->total_count = index;
+      if (have_total) {
+        out->total_count = count_cache_total;
+      } else {
+        out->total_count = index;
+        strncpy(count_cache_path, request.directory,
+                sizeof(count_cache_path) - 1);
+        count_cache_total = index;
+      }
       out->success = true;
     }
     if (dir)
       dir.close();
+    sd_release();
     return mt_send_uplink(response);
   }
 
   case meshtastic_InterdeviceMessage_get_sd_info_tag: {
-    // SD card statistics. The used-bytes calculation scans the FAT on
-    // FAT16/32 cards, which can take a while on the first call.
+    // SD card statistics, answered entirely from state cached at mount
+    // time so the response never waits on the card (this also serves as
+    // the readiness probe target for older ESP32 firmware)
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
     response.id = message.id; // correlate with the request
     response.which_data = meshtastic_InterdeviceMessage_sd_info_tag;
-    meshtastic_SdCardInfo *info = &response.data.sd_info;
+    sd_get_info(&response.data.sd_info);
+    return mt_send_uplink(response);
+  }
 
-    if (sd_ensure()) {
-      info->present = true;
-      info->card_size = SD.size64();
-      switch (SD.fatType()) {
-      case 16:
-        info->fat_type = meshtastic_SdCardInfo_FatType_FAT16;
-        break;
-      case 32:
-        info->fat_type = meshtastic_SdCardInfo_FatType_FAT32;
-        break;
-      case 64:
-        info->fat_type = meshtastic_SdCardInfo_FatType_EXFAT;
-        break;
-      default:
-        info->fat_type = meshtastic_SdCardInfo_FatType_UNKNOWN_FAT;
-      }
-      switch (SD.type()) {
-      case 0: // SD1
-      case 1: // SD2
-        info->card_type = meshtastic_SdCardInfo_CardType_SD;
-        break;
-      case 3: // SDHC or SDXC, differ by capacity
-        info->card_type = info->card_size > 32ull * 1000 * 1000 * 1000
-                              ? meshtastic_SdCardInfo_CardType_SDXC
-                              : meshtastic_SdCardInfo_CardType_SDHC;
-        break;
-      default:
-        info->card_type = meshtastic_SdCardInfo_CardType_UNKNOWN_CARD;
-      }
-      // from the background scan; zero while it is still running
-      uint64_t used, free_bytes;
-      if (sd_used_free(&used, &free_bytes)) {
-        info->used_bytes = used;
-        info->free_bytes = free_bytes;
-      }
-    }
+  case meshtastic_InterdeviceMessage_ping_tag: {
+    // liveness probe, must work with nothing attached to this MCU
+    meshtastic_InterdeviceMessage &response = tx_response;
+    memset(&response, 0, sizeof(response));
+    response.id = message.id; // correlate with the request
+    response.which_data = meshtastic_InterdeviceMessage_pong_tag;
+    response.data.pong = true;
     return mt_send_uplink(response);
   }
 
