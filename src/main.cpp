@@ -111,17 +111,24 @@ void sd_get_info(meshtastic_SdCardInfo *out) {
   memset(out, 0, sizeof(*out));
   if (!sd_mounted)
     return;
-  *out = sd_info_cache; // stable while mounted
-  out->present = true;
-  // used/free stay zero while the scan is still running (mutex held by
-  // core1) or has not completed yet
+  // under the mutex: core1 rewrites the identity cache on a remount, and a
+  // torn copy would report a mix of the old and the new card. used/free
+  // stay zero while its background scan has not finished.
   if (mutex_try_enter(&sd_mutex, NULL)) {
-    if (sd_stats_valid) {
-      out->used_bytes = sd_used_bytes;
-      out->free_bytes = sd_free_bytes;
-      out->stats_valid = true;
+    if (sd_mounted) {
+      *out = sd_info_cache;
+      out->present = true;
+      if (sd_stats_valid) {
+        out->used_bytes = sd_used_bytes;
+        out->free_bytes = sd_free_bytes;
+        out->stats_valid = true;
+      }
     }
     mutex_exit(&sd_mutex);
+  } else {
+    // core1 is busy with the card; the identity is still what it was
+    *out = sd_info_cache;
+    out->present = true;
   }
 }
 
@@ -177,6 +184,9 @@ void loop1() {
     sd_mounted = false;
     sd_stats_valid = false;
     sd_generation++;
+    // core0 may have re-opened a handle between marking the card dead and
+    // this point; it must not outlive the volume it belongs to
+    sd_close_cached_files();
     SD.end(false);
     mutex_exit(&sd_mutex);
     sd_recheck = false;
@@ -201,6 +211,7 @@ void loop1() {
       if (ok) {
         // published after the info cache is fully written
         sd_mounted = true;
+        sd_last_access = millis(); // the idle window starts here
         Serial.println("card initialized.");
       }
       sd_mounting = false;

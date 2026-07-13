@@ -82,6 +82,18 @@ static bool i2c_device_present(uint8_t addr) {
   return Wire.endTransmission() == 0;
 }
 
+// An operation on a path can fail because the path is wrong or because the
+// card is gone; only the card itself can tell us apart. Reading the root
+// directory touches the card, so a mounted card that cannot produce it has
+// been pulled. Called only on failure paths.
+static bool card_still_there(void) {
+  if (SD.exists("/"))
+    return true;
+  Serial.println("SD card stopped responding");
+  sd_mark_dead();
+  return false;
+}
+
 // Parse a packet that came in, and handle it. Return true if we were able to
 // parse it.
 bool mt_handle_packet(size_t payload_len) {
@@ -195,7 +207,11 @@ bool mt_handle_packet(size_t payload_len) {
         invalidate_read_cache();
         read_cache = SD.open(request.filepath, FILE_READ);
         if (!read_cache) {
-          out->status = meshtastic_FileStatus_FILE_NOT_FOUND;
+          // a pulled card fails exactly like a missing file, and map tiles
+          // are probed constantly: this is the path that must notice
+          out->status = card_still_there()
+                            ? meshtastic_FileStatus_FILE_NOT_FOUND
+                            : meshtastic_FileStatus_FILE_NO_CARD;
           break;
         }
         if (read_cache.isDirectory()) {
@@ -236,14 +252,21 @@ bool mt_handle_packet(size_t payload_len) {
     case meshtastic_FileOperation_POST:
     case meshtastic_FileOperation_PUT: {
       invalidate_read_cache();
-      if (request.operation == meshtastic_FileOperation_POST &&
-          SD.exists(request.filepath))
-        SD.remove(request.filepath);
+      if (request.operation == meshtastic_FileOperation_POST) {
+        if (request.offset != 0) {
+          // a POST starts a new file; truncating for a chunk that is not
+          // the first one would destroy what is already there
+          out->status = meshtastic_FileStatus_FILE_OFFSET_CONFLICT;
+          break;
+        }
+        if (SD.exists(request.filepath))
+          SD.remove(request.filepath);
+      }
       File f = SD.open(request.filepath, FILE_WRITE); // append mode, creates
       if (!f) {
-        // a full card or a bad path fails here just like a pulled card
-        // does, so do not unmount on it
-        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        // a full card, a bad path and a pulled card all fail here
+        out->status = card_still_there() ? meshtastic_FileStatus_FILE_IO_ERROR
+                                         : meshtastic_FileStatus_FILE_NO_CARD;
         strncpy(out->message, "open failed", sizeof(out->message) - 1);
         break;
       }
@@ -260,9 +283,10 @@ bool mt_handle_packet(size_t payload_len) {
         out->status = meshtastic_FileStatus_FILE_OK;
         sd_note_write();
       } else {
-        // short write: card full, or the card went away. Do not unmount,
-        // a full card would thrash between remounts
-        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        // short write: a full card (do not unmount, it would thrash between
+        // remounts) or a card that went away
+        out->status = card_still_there() ? meshtastic_FileStatus_FILE_IO_ERROR
+                                         : meshtastic_FileStatus_FILE_NO_CARD;
         strncpy(out->message, "write failed", sizeof(out->message) - 1);
       }
       count_cache_path[0] = '\0';
@@ -277,7 +301,8 @@ bool mt_handle_packet(size_t payload_len) {
         out->status = meshtastic_FileStatus_FILE_OK;
         sd_note_write();
       } else {
-        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        out->status = card_still_there() ? meshtastic_FileStatus_FILE_IO_ERROR
+                                         : meshtastic_FileStatus_FILE_NO_CARD;
         strncpy(out->message, "remove failed", sizeof(out->message) - 1);
       }
       count_cache_path[0] = '\0';
@@ -311,37 +336,38 @@ bool mt_handle_packet(size_t payload_len) {
     check_sd_generation();
 
     File dir = SD.open(request.directory);
-    if (!dir) {
-      out->status = meshtastic_FileStatus_FILE_NOT_FOUND;
-    } else if (!dir.isDirectory()) {
-      out->status = meshtastic_FileStatus_FILE_NOT_A_FILE;
+    bool is_dir = dir && dir.isDirectory();
+    if (dir)
+      dir.close();
+    if (!is_dir) {
+      out->status =
+          SD.exists(request.directory)
+              ? meshtastic_FileStatus_FILE_NOT_A_FILE
+              : (card_still_there() ? meshtastic_FileStatus_FILE_NOT_FOUND
+                                    : meshtastic_FileStatus_FILE_NO_CARD);
     } else {
       const size_t max_names =
           sizeof(out->filenames) / sizeof(out->filenames[0]);
-      // Walking to the end of the directory just to count the entries is
-      // expensive (a full LFN-parsing walk per page); do it once on the
-      // first page and reuse the count for the follow-up pages
+      // Iterate with the Dir API: openNextFile() re-opens every entry by
+      // full path, which turns a directory walk into an O(n^2) scan and can
+      // block core0 for minutes on a directory full of map tiles.
+      Dir d = SDFS.openDir(request.directory);
+      // Counting the entries means walking the whole directory, so do it
+      // once on the first page and reuse the count for the follow-up pages
       bool have_total = request.offset > 0 &&
                         strcmp(count_cache_path, request.directory) == 0;
       uint32_t index = 0;
-      while (true) {
-        File entry = dir.openNextFile();
-        if (!entry)
-          break;
+      while (d.next()) {
         if (index >= request.offset && out->filenames_count < max_names) {
           snprintf(out->filenames[out->filenames_count],
-                   sizeof(out->filenames[0]), "%s%s", entry.name(),
-                   entry.isDirectory() ? "/" : "");
+                   sizeof(out->filenames[0]), "%s%s", d.fileName().c_str(),
+                   d.isDirectory() ? "/" : "");
           out->filenames_count++;
         }
         index++;
-        entry.close();
         if (have_total && out->filenames_count >= max_names)
-          break; // page full, the total is already known
-        // the core re-opens every entry by path, so a directory with
-        // thousands of tiles takes a while: keep the watchdog fed
-        if ((index & 0x3f) == 0)
-          rp2040.wdt_reset();
+          break;            // page full, the total is already known
+        rp2040.wdt_reset(); // a big directory still takes a while
       }
       if (have_total) {
         out->total_count = count_cache_total;
@@ -353,8 +379,6 @@ bool mt_handle_packet(size_t payload_len) {
       }
       out->status = meshtastic_FileStatus_FILE_OK;
     }
-    if (dir)
-      dir.close();
     sd_release();
     return mt_send_uplink(response);
   }
@@ -375,14 +399,15 @@ bool mt_handle_packet(size_t payload_len) {
     // Liveness probe and version handshake, must work with nothing
     // attached to this MCU. Always answer with the version we speak: the
     // main firmware compares it and shuts the bridge down on a mismatch.
-    static bool mismatch_logged = false;
+    static uint32_t logged_peer_version = UINT32_MAX;
     if (message.data.ping !=
             meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT &&
-        !mismatch_logged) {
-      // Once per boot: the peer probes repeatedly while the link is down,
-      // and a USB CDC write blocks for up to a second when a host is
-      // attached but not reading.
-      mismatch_logged = true;
+        message.data.ping != logged_peer_version) {
+      // Only when the version we see changes: the peer probes repeatedly
+      // while the link is down, and a USB CDC write blocks for up to a
+      // second when a host is attached but not reading. Reflashing the peer
+      // to another (still wrong) version does get logged again.
+      logged_peer_version = message.data.ping;
       Serial.printf(
           "Peer speaks interdevice protocol v%u, we speak v%u\r\n",
           (unsigned)message.data.ping,
