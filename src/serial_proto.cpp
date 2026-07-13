@@ -353,12 +353,21 @@ bool mt_handle_packet(size_t payload_len) {
   }
 
   case meshtastic_InterdeviceMessage_ping_tag: {
-    // liveness probe, must work with nothing attached to this MCU
+    // Liveness probe and version handshake, must work with nothing
+    // attached to this MCU. Always answer with the version we speak: the
+    // main firmware compares it and shuts the bridge down on a mismatch.
+    if (message.data.ping !=
+        meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT)
+      Serial.printf(
+          "Peer speaks interdevice protocol v%u, we speak v%u\r\n",
+          (unsigned)message.data.ping,
+          (unsigned)meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT);
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
     response.id = message.id; // correlate with the request
     response.which_data = meshtastic_InterdeviceMessage_pong_tag;
-    response.data.pong = true;
+    response.data.pong =
+        meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT;
     return mt_send_uplink(response);
   }
 
