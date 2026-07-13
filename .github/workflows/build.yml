@@ -39,7 +39,7 @@ jobs:
           restore-keys: pio-${{ runner.os }}-
 
       - name: Install PlatformIO
-        run: pip install --upgrade https://github.com/pioarduino/platformio-core/archive/develop.tar.gz
+        run: pip install --upgrade https://github.com/pioarduino/platformio-core/archive/487a894a713d36acbd9d858267076d0ab957d543.zip
 
       - name: Build firmware
         run: pio run -e seeed_indicator_rp2040
