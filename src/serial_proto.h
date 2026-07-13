@@ -13,6 +13,8 @@
 #define MT_HEADER_SIZE 4
 
 bool mt_send_uplink(const meshtastic_InterdeviceMessage &message);
+// unsolicited ping at boot, so the main firmware notices us coming (back) up
+bool mt_send_hello(void);
 void mt_set_nmea_callback(void (*callback)(char *nmea));
 void mt_loop();
 
@@ -26,7 +28,9 @@ void sd_mark_dead(void);
 // drops cached file handles; called with the card mutex held, right before
 // core1 unmounts (implemented next to the caches, in serial_proto.cpp)
 void sd_close_cached_files(void);
-void sd_note_write(void);
+// a write changed the filesystem by this many bytes (negative when it freed
+// them); keeps used/free current without another full FAT walk
+void sd_account_bytes(int64_t delta);
 void sd_get_info(meshtastic_SdCardInfo *out);
 // bumped on every unmount, open file handles do not survive a remount
 extern volatile uint32_t sd_generation;

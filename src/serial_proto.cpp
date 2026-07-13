@@ -63,6 +63,17 @@ bool mt_send(const char *buf, size_t len) {
   return false;
 }
 
+// Unsolicited ping at boot: tells the main firmware we are (back) up and
+// which protocol version we speak, without it having to poll for us.
+bool mt_send_hello(void) {
+  meshtastic_InterdeviceMessage &response = tx_response;
+  memset(&response, 0, sizeof(response));
+  response.which_data = meshtastic_InterdeviceMessage_ping_tag;
+  response.data.ping =
+      meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT;
+  return mt_send_uplink(response);
+}
+
 // The requester fails fast on a nack instead of burning its timeout.
 // id 0 when the request could not even be decoded.
 static bool mt_send_nack(uint32_t id) {
@@ -80,6 +91,17 @@ static bool mt_send_nack(uint32_t id) {
 static bool i2c_device_present(uint8_t addr) {
   Wire.beginTransmission(addr);
   return Wire.endTransmission() == 0;
+}
+
+// Size of an existing file, 0 when it is not one. Used to keep the used/free
+// accounting straight across writes and deletes.
+static uint64_t file_size_of(const char *path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f)
+    return 0;
+  uint64_t size = f.isDirectory() ? 0 : (uint64_t)f.size();
+  f.close();
+  return size;
 }
 
 // An operation on a path can fail because the path is wrong or because the
@@ -259,8 +281,10 @@ bool mt_handle_packet(size_t payload_len) {
           out->status = meshtastic_FileStatus_FILE_OFFSET_CONFLICT;
           break;
         }
-        if (SD.exists(request.filepath))
+        if (SD.exists(request.filepath)) {
+          sd_account_bytes(-(int64_t)file_size_of(request.filepath));
           SD.remove(request.filepath);
+        }
       }
       File f = SD.open(request.filepath, FILE_WRITE); // append mode, creates
       if (!f) {
@@ -279,9 +303,9 @@ bool mt_handle_packet(size_t payload_len) {
       size_t wrote = f.write(request.filedata.bytes, request.filedata.size);
       out->file_size = f.size();
       f.close();
+      sd_account_bytes((int64_t)wrote);
       if (wrote == request.filedata.size) {
         out->status = meshtastic_FileStatus_FILE_OK;
-        sd_note_write();
       } else {
         // short write: a full card (do not unmount, it would thrash between
         // remounts) or a card that went away
@@ -293,13 +317,14 @@ bool mt_handle_packet(size_t payload_len) {
       break;
     }
 
-    case meshtastic_FileOperation_DELETE:
+    case meshtastic_FileOperation_DELETE: {
       invalidate_read_cache();
+      uint64_t freed = file_size_of(request.filepath);
       // idempotent: a file that is already gone is the requested outcome,
       // so a retried delete after a lost response reports OK
       if (SD.remove(request.filepath) || !SD.exists(request.filepath)) {
         out->status = meshtastic_FileStatus_FILE_OK;
-        sd_note_write();
+        sd_account_bytes(-(int64_t)freed);
       } else {
         out->status = card_still_there() ? meshtastic_FileStatus_FILE_IO_ERROR
                                          : meshtastic_FileStatus_FILE_NO_CARD;
@@ -307,6 +332,7 @@ bool mt_handle_packet(size_t payload_len) {
       }
       count_cache_path[0] = '\0';
       break;
+    }
 
     default:
       out->status = meshtastic_FileStatus_FILE_IO_ERROR;
@@ -436,6 +462,8 @@ bool mt_handle_packet(size_t payload_len) {
       if (Wire.endTransmission() == 0)
         response.data.i2c_scan_result
             .bytes[response.data.i2c_scan_result.size++] = addr;
+      // a hung bus times out per address, which adds up past the watchdog
+      rp2040.wdt_reset();
     }
     // a stuck-low SDA acks every probe; report a fault as an empty scan
     // rather than 112 phantom devices

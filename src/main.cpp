@@ -97,11 +97,24 @@ void sd_mark_dead(void) {
   sd_recheck = true;
 }
 
-// A write changed the filesystem; refresh the stats (rate-limited on core1)
-void sd_note_write(void) {
-  if (!sd_stats_pending) {
-    stats_pending_since = millis();
-    sd_stats_pending = true;
+// A write changed the filesystem by this many bytes (negative when it freed
+// them). The full scan behind used/free walks the whole FAT and holds the
+// card for seconds, which would starve the map tiles the writes belong to,
+// so keep the numbers current by accounting instead of rescanning. Cluster
+// slack is ignored: this is a UI readout, not a budget.
+// Called from a file operation, i.e. with the card mutex already held (it is
+// not recursive, so this must not take it again).
+void sd_account_bytes(int64_t delta) {
+  if (!sd_stats_valid || delta == 0)
+    return;
+  if (delta > 0) {
+    uint64_t d = (uint64_t)delta;
+    sd_used_bytes += d;
+    sd_free_bytes = sd_free_bytes > d ? sd_free_bytes - d : 0;
+  } else {
+    uint64_t d = (uint64_t)(-delta);
+    sd_used_bytes = sd_used_bytes > d ? sd_used_bytes - d : 0;
+    sd_free_bytes += d;
   }
 }
 
@@ -109,26 +122,29 @@ void sd_note_write(void) {
 // response never waits on the card
 void sd_get_info(meshtastic_SdCardInfo *out) {
   memset(out, 0, sizeof(*out));
+  if (sd_mounting) {
+    // no card mounted, but whether one is present is not decided yet: the
+    // requester must ask again instead of reporting an empty slot
+    out->busy = true;
+    return;
+  }
   if (!sd_mounted)
     return;
-  // under the mutex: core1 rewrites the identity cache on a remount, and a
-  // torn copy would report a mix of the old and the new card. used/free
-  // stay zero while its background scan has not finished.
-  if (mutex_try_enter(&sd_mutex, NULL)) {
-    if (sd_mounted) {
-      *out = sd_info_cache;
-      out->present = true;
-      if (sd_stats_valid) {
-        out->used_bytes = sd_used_bytes;
-        out->free_bytes = sd_free_bytes;
-        out->stats_valid = true;
-      }
-    }
-    mutex_exit(&sd_mutex);
-  } else {
-    // core1 is busy with the card; the identity is still what it was
-    *out = sd_info_cache;
-    out->present = true;
+  // Never waits for the card: core1 can hold the mutex for seconds. The
+  // identity cache is only rewritten while unmounted, so a generation that
+  // did not change across the copy proves it did not come from two cards.
+  uint32_t generation = sd_generation;
+  *out = sd_info_cache;
+  if (generation != sd_generation || !sd_mounted) {
+    memset(out, 0, sizeof(*out));
+    out->busy = true; // remounting right now
+    return;
+  }
+  out->present = true;
+  if (sd_stats_valid) {
+    out->used_bytes = sd_used_bytes;
+    out->free_bytes = sd_free_bytes;
+    out->stats_valid = true;
   }
 }
 
@@ -177,7 +193,6 @@ void setup1() {
 
 void loop1() {
   static uint32_t last_mount = 0;
-  static uint32_t last_scan = 0;
 
   if (sd_recheck) {
     mutex_enter_blocking(&sd_mutex);
@@ -220,18 +235,17 @@ void loop1() {
       last_mount = millis();
     }
   } else if (sd_stats_pending) {
-    // The free space scan walks the whole FAT (SdFat keeps no cached
-    // cluster count) and holds the card for seconds, so only start it when
-    // core0 has not touched the card for a while: serving map tiles beats
-    // knowing the free space. Write-triggered refreshes wait a minute on
-    // top of that.
-    uint32_t interval = sd_stats_valid ? 60000 : 0;
+    // The free space scan walks the whole FAT (SdFat keeps no cached cluster
+    // count) and holds the card for seconds, so it runs once per mount and
+    // only when core0 has not touched the card for a while: serving map
+    // tiles beats knowing the free space. Later writes keep the numbers
+    // current by accounting (sd_account_bytes), so no rescan follows them.
+    //
     // A steady stream of tile reads would keep the card busy forever, so
-    // stop waiting for an idle window after a while and just take the card:
-    // the requester retries a BUSY response.
+    // stop waiting for an idle window after a while and just take it: the
+    // requester retries the BUSY responses that costs.
     bool waited_long_enough = millis() - stats_pending_since >= 30000;
-    if ((last_scan == 0 || millis() - last_scan >= interval) &&
-        (millis() - sd_last_access >= 3000 || waited_long_enough)) {
+    if (millis() - sd_last_access >= 3000 || waited_long_enough) {
       FSInfo info;
       mutex_enter_blocking(&sd_mutex);
       SDFS.info(info);
@@ -249,7 +263,6 @@ void loop1() {
       mutex_exit(&sd_mutex);
       if (!ok)
         sd_recheck = true; // a FAT walk only fails when the card is gone
-      last_scan = millis();
     }
   }
   delay(20);
@@ -328,6 +341,11 @@ void setup() {
 
   Serial.printf(SENSECAP, VERSION);
   beep_on(50);
+
+  // Announce ourselves: the main firmware may have finished its own boot
+  // (and its peripheral scan) while we were still starting, and it has no
+  // other way of noticing that we came up or rebooted.
+  mt_send_hello();
 
   // This MCU is the sole path to GPS, sensors and SD card; a wedged
   // peripheral driver must reboot it rather than take them down for good.
