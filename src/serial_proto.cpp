@@ -55,6 +55,25 @@ bool mt_send(const char *buf, size_t len) {
   return false;
 }
 
+// The requester fails fast on a nack instead of burning its timeout.
+// id 0 when the request could not even be decoded.
+static bool mt_send_nack(uint32_t id) {
+  meshtastic_InterdeviceMessage &response = tx_response;
+  memset(&response, 0, sizeof(response));
+  response.id = id;
+  response.which_data = meshtastic_InterdeviceMessage_nack_tag;
+  response.data.nack = true;
+  return mt_send_uplink(response);
+}
+
+// The core reports any failed non-empty write as a generic error; a
+// zero-length probe (bit-banged, always classifies) tells an absent
+// device apart from a data NACK or bus fault
+static bool i2c_device_present(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
 // Parse a packet that came in, and handle it. Return true if we were able to
 // parse it.
 bool mt_handle_packet(size_t payload_len) {
@@ -74,6 +93,7 @@ bool mt_handle_packet(size_t payload_len) {
 
   if (!status) {
     Serial.println("Decoding failed");
+    mt_send_nack(0);
     return false;
   }
 
@@ -116,7 +136,9 @@ bool mt_handle_packet(size_t payload_len) {
         result->status = meshtastic_I2CResult_Status_NACK_DATA;
         break;
       default:
-        result->status = meshtastic_I2CResult_Status_ERROR;
+        result->status = i2c_device_present((uint8_t)transaction.address)
+                             ? meshtastic_I2CResult_Status_NACK_DATA
+                             : meshtastic_I2CResult_Status_NACK_ADDRESS;
       }
     }
 
@@ -127,7 +149,10 @@ bool mt_handle_packet(size_t payload_len) {
         want = sizeof(result->read_data.bytes);
       size_t got = Wire.requestFrom((uint8_t)transaction.address, want);
       if (got == 0)
-        result->status = meshtastic_I2CResult_Status_NACK_ADDRESS;
+        // a failed read can also be a bus timeout with the device present
+        result->status = i2c_device_present((uint8_t)transaction.address)
+                             ? meshtastic_I2CResult_Status_ERROR
+                             : meshtastic_I2CResult_Status_NACK_ADDRESS;
       while (Wire.available() && result->read_data.size < got)
         result->read_data.bytes[result->read_data.size++] = Wire.read();
     }
@@ -361,9 +386,15 @@ bool mt_handle_packet(size_t payload_len) {
     return mt_send_uplink(response);
   }
 
+  case meshtastic_InterdeviceMessage_pong_tag:
+  case meshtastic_InterdeviceMessage_nack_tag:
+    // never react to these, a nacked nack would ping-pong forever
+    return true;
+
   default:
     // the other messages really only flow downstream
     Serial.println("Got a message of unexpected type");
+    mt_send_nack(message.id);
     return false;
   }
 }
