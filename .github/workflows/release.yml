@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [created, published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and attach the firmware to"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve tag and version
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+        run: |
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade https://github.com/pioarduino/platformio-core/archive/develop.tar.gz
+
+      - name: Build firmware
+        run: pio run -e seeed_indicator_rp2040
+
+      - name: Bundle release archive
+        id: bundle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          name="indicator_rp2040-${VERSION}"
+          build=.pio/build/seeed_indicator_rp2040
+          mkdir -p "dist/${name}"
+          cp "${build}/firmware.uf2" "dist/${name}/${name}.uf2"
+          cp "${build}/firmware.elf" "dist/${name}/${name}.elf"
+          cp "${build}/firmware.bin" "dist/${name}/${name}.bin"
+          cp LICENSE README.md "dist/${name}/"
+          (cd dist && zip -r "${name}.zip" "${name}")
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.bundle.outputs.name }}
+          path: dist/${{ steps.bundle.outputs.name }}.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          # Only author the notes when this run is what creates the release.
+          # A release-triggered run must not overwrite notes that already exist.
+          generate_release_notes: ${{ github.event_name != 'release' }}
+          draft: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/${{ steps.bundle.outputs.name }}.zip
+            .pio/build/seeed_indicator_rp2040/firmware.uf2
