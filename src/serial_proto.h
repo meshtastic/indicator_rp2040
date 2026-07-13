@@ -23,6 +23,9 @@ enum { SD_CLAIM_OK = 0, SD_CLAIM_NOCARD, SD_CLAIM_BUSY };
 int sd_claim(void);
 void sd_release(void);
 void sd_mark_dead(void);
+// drops cached file handles; called with the card mutex held, right before
+// core1 unmounts (implemented next to the caches, in serial_proto.cpp)
+void sd_close_cached_files(void);
 void sd_note_write(void);
 void sd_get_info(meshtastic_SdCardInfo *out);
 // bumped on every unmount, open file handles do not survive a remount

@@ -19,6 +19,14 @@ static void invalidate_read_cache() {
   read_cache_path[0] = '\0';
 }
 
+// Called by core1 (holding the mutex, before it unmounts) so the handle is
+// closed against the volume it belongs to. Closing it after the remount
+// would flush the old volume's sector cache onto the new card.
+void sd_close_cached_files(void) {
+  invalidate_read_cache();
+  count_cache_path[0] = '\0';
+}
+
 // call before any card access: file handles do not survive a remount
 static void check_sd_generation() {
   static uint32_t seen_generation = 0;
@@ -114,7 +122,7 @@ bool mt_handle_packet(size_t payload_len) {
   case meshtastic_InterdeviceMessage_i2c_transaction_tag: {
     // Execute a tunneled I2C transaction: an optional write followed by an
     // optional read with repeated start
-    meshtastic_I2CTransaction transaction = message.data.i2c_transaction;
+    meshtastic_I2CTransaction &transaction = message.data.i2c_transaction;
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
     response.id = message.id; // correlate with the request
@@ -172,12 +180,11 @@ bool mt_handle_packet(size_t payload_len) {
     out->operation = request.operation;
     strncpy(out->filepath, request.filepath, sizeof(out->filepath) - 1);
     out->offset = request.offset;
-    out->success = false;
 
     int claim = sd_claim();
     if (claim != SD_CLAIM_OK) {
-      strncpy(out->message, claim == SD_CLAIM_BUSY ? "SD busy" : "no SD card",
-              sizeof(out->message) - 1);
+      out->status = claim == SD_CLAIM_BUSY ? meshtastic_FileStatus_FILE_BUSY
+                                           : meshtastic_FileStatus_FILE_NO_CARD;
       return mt_send_uplink(response);
     }
     check_sd_generation();
@@ -188,13 +195,13 @@ bool mt_handle_packet(size_t payload_len) {
         invalidate_read_cache();
         read_cache = SD.open(request.filepath, FILE_READ);
         if (!read_cache) {
-          strncpy(out->message, "open failed", sizeof(out->message) - 1);
+          out->status = meshtastic_FileStatus_FILE_NOT_FOUND;
           break;
         }
         if (read_cache.isDirectory()) {
           // reading one returns raw directory entries, not file content
           invalidate_read_cache();
-          strncpy(out->message, "not a file", sizeof(out->message) - 1);
+          out->status = meshtastic_FileStatus_FILE_NOT_A_FILE;
           break;
         }
         strncpy(read_cache_path, request.filepath, sizeof(read_cache_path) - 1);
@@ -203,24 +210,26 @@ bool mt_handle_packet(size_t payload_len) {
       size_t want = request.length;
       if (want == 0 || want > sizeof(out->filedata.bytes))
         want = sizeof(out->filedata.bytes);
-      if (request.offset > 0xFFFFFFFFull) {
-        // the FS layer seeks with 32 bit positions
-        strncpy(out->message, "offset too large", sizeof(out->message) - 1);
+      // the FS layer seeks with 32 bit positions, and seeking past the end
+      // is a request error, not a card failure
+      if (request.offset > 0xFFFFFFFFull ||
+          request.offset > (uint64_t)read_cache.size()) {
+        out->status = meshtastic_FileStatus_FILE_OFFSET_CONFLICT;
         break;
       }
       if (!read_cache.seek((uint32_t)request.offset)) {
-        strncpy(out->message, "seek failed", sizeof(out->message) - 1);
-        sd_mark_dead(); // seek on an open handle only fails at card level
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        sd_mark_dead(); // in range, so the card itself failed
         break;
       }
       int got = read_cache.read(out->filedata.bytes, want);
       if (got < 0) {
-        strncpy(out->message, "read failed", sizeof(out->message) - 1);
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
         sd_mark_dead();
         break;
       }
       out->filedata.size = got;
-      out->success = true;
+      out->status = meshtastic_FileStatus_FILE_OK;
       break;
     }
 
@@ -232,29 +241,29 @@ bool mt_handle_packet(size_t payload_len) {
         SD.remove(request.filepath);
       File f = SD.open(request.filepath, FILE_WRITE); // append mode, creates
       if (!f) {
+        // a full card or a bad path fails here just like a pulled card
+        // does, so do not unmount on it
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
         strncpy(out->message, "open failed", sizeof(out->message) - 1);
-        // creating a file on a healthy card does not fail; assume the
-        // card was pulled and let core1 verify with a remount
-        sd_mark_dead();
         break;
       }
       if (f.size() != request.offset) {
-        snprintf(out->message, sizeof(out->message),
-                 "bad offset %u, file size %u", (unsigned)request.offset,
-                 (unsigned)f.size());
-        out->file_size = f.size(); // lets the client resync its offset
+        out->status = meshtastic_FileStatus_FILE_OFFSET_CONFLICT;
+        out->file_size = f.size(); // lets the writer resync its offset
         f.close();
         break;
       }
       size_t wrote = f.write(request.filedata.bytes, request.filedata.size);
       out->file_size = f.size();
       f.close();
-      out->success = (wrote == request.filedata.size);
-      if (!out->success) {
-        strncpy(out->message, "write failed", sizeof(out->message) - 1);
-        sd_mark_dead();
-      } else {
+      if (wrote == request.filedata.size) {
+        out->status = meshtastic_FileStatus_FILE_OK;
         sd_note_write();
+      } else {
+        // short write: card full, or the card went away. Do not unmount,
+        // a full card would thrash between remounts
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        strncpy(out->message, "write failed", sizeof(out->message) - 1);
       }
       count_cache_path[0] = '\0';
       break;
@@ -262,15 +271,20 @@ bool mt_handle_packet(size_t payload_len) {
 
     case meshtastic_FileOperation_DELETE:
       invalidate_read_cache();
-      out->success = SD.remove(request.filepath);
-      if (!out->success)
-        strncpy(out->message, "remove failed", sizeof(out->message) - 1);
-      else
+      // idempotent: a file that is already gone is the requested outcome,
+      // so a retried delete after a lost response reports OK
+      if (SD.remove(request.filepath) || !SD.exists(request.filepath)) {
+        out->status = meshtastic_FileStatus_FILE_OK;
         sd_note_write();
+      } else {
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        strncpy(out->message, "remove failed", sizeof(out->message) - 1);
+      }
       count_cache_path[0] = '\0';
       break;
 
     default:
+      out->status = meshtastic_FileStatus_FILE_IO_ERROR;
       strncpy(out->message, "unknown operation", sizeof(out->message) - 1);
     }
     sd_release();
@@ -287,19 +301,20 @@ bool mt_handle_packet(size_t payload_len) {
     meshtastic_DirectoryListing *out = &response.data.directory_listing;
     strncpy(out->directory, request.directory, sizeof(out->directory) - 1);
     out->offset = request.offset;
-    out->success = false;
 
     int claim = sd_claim();
     if (claim != SD_CLAIM_OK) {
-      strncpy(out->message, claim == SD_CLAIM_BUSY ? "SD busy" : "no SD card",
-              sizeof(out->message) - 1);
+      out->status = claim == SD_CLAIM_BUSY ? meshtastic_FileStatus_FILE_BUSY
+                                           : meshtastic_FileStatus_FILE_NO_CARD;
       return mt_send_uplink(response);
     }
     check_sd_generation();
 
     File dir = SD.open(request.directory);
-    if (!dir || !dir.isDirectory()) {
-      strncpy(out->message, "not a directory", sizeof(out->message) - 1);
+    if (!dir) {
+      out->status = meshtastic_FileStatus_FILE_NOT_FOUND;
+    } else if (!dir.isDirectory()) {
+      out->status = meshtastic_FileStatus_FILE_NOT_A_FILE;
     } else {
       const size_t max_names =
           sizeof(out->filenames) / sizeof(out->filenames[0]);
@@ -323,6 +338,10 @@ bool mt_handle_packet(size_t payload_len) {
         entry.close();
         if (have_total && out->filenames_count >= max_names)
           break; // page full, the total is already known
+        // the core re-opens every entry by path, so a directory with
+        // thousands of tiles takes a while: keep the watchdog fed
+        if ((index & 0x3f) == 0)
+          rp2040.wdt_reset();
       }
       if (have_total) {
         out->total_count = count_cache_total;
@@ -332,7 +351,7 @@ bool mt_handle_packet(size_t payload_len) {
                 sizeof(count_cache_path) - 1);
         count_cache_total = index;
       }
-      out->success = true;
+      out->status = meshtastic_FileStatus_FILE_OK;
     }
     if (dir)
       dir.close();
@@ -356,12 +375,19 @@ bool mt_handle_packet(size_t payload_len) {
     // Liveness probe and version handshake, must work with nothing
     // attached to this MCU. Always answer with the version we speak: the
     // main firmware compares it and shuts the bridge down on a mismatch.
+    static bool mismatch_logged = false;
     if (message.data.ping !=
-        meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT)
+            meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT &&
+        !mismatch_logged) {
+      // Once per boot: the peer probes repeatedly while the link is down,
+      // and a USB CDC write blocks for up to a second when a host is
+      // attached but not reading.
+      mismatch_logged = true;
       Serial.printf(
           "Peer speaks interdevice protocol v%u, we speak v%u\r\n",
           (unsigned)message.data.ping,
           (unsigned)meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT);
+    }
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
     response.id = message.id; // correlate with the request

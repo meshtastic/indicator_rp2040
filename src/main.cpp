@@ -43,6 +43,10 @@ static volatile bool sd_recheck = false;
 // survive a remount
 volatile uint32_t sd_generation = 0;
 
+// last time core0 touched the card; core1 keeps its multi-second
+// maintenance off the card while requests are still flowing
+static volatile uint32_t sd_last_access = 0;
+
 // used/free statistics from the core1 scan
 static volatile bool sd_stats_pending = false;
 static bool sd_stats_valid = false;
@@ -57,20 +61,35 @@ static meshtastic_SdCardInfo sd_info_cache;
 // is mounting or scanning right now; the caller reports that instead of
 // waiting for it.
 int sd_claim(void) {
+  // checked before the try-lock: core1 holds the mutex for the whole
+  // (2 second) mount attempt on an empty slot, and answering BUSY there
+  // would make an empty slot look like a card that is merely busy
+  if (!sd_mounted)
+    return SD_CLAIM_NOCARD;
   if (!mutex_try_enter(&sd_mutex, NULL))
     return SD_CLAIM_BUSY;
   if (!sd_mounted) {
     mutex_exit(&sd_mutex);
     return SD_CLAIM_NOCARD;
   }
+  sd_last_access = millis(); // keeps core1 off the card while requests flow
   return SD_CLAIM_OK;
 }
 
-void sd_release(void) { mutex_exit(&sd_mutex); }
+void sd_release(void) {
+  sd_last_access = millis();
+  mutex_exit(&sd_mutex);
+}
 
 // A card-level failure was observed on a mounted card: assume it was
-// pulled and have core1 recover with a clean remount
-void sd_mark_dead(void) { sd_recheck = true; }
+// pulled and have core1 recover with a clean remount. Only for genuine
+// card failures: a full card or a bad path must not unmount anything.
+// The caller still holds the mutex, so drop the cached handle here rather
+// than after the remount, when it would belong to the old volume.
+void sd_mark_dead(void) {
+  sd_close_cached_files();
+  sd_recheck = true;
+}
 
 // A write changed the filesystem; refresh the stats (rate-limited on core1)
 void sd_note_write(void) { sd_stats_pending = true; }
@@ -176,22 +195,31 @@ void loop1() {
       last_mount = millis();
     }
   } else if (sd_stats_pending) {
-    // initial scan right after mount, write-triggered refreshes at most
-    // once a minute (each scan blocks file requests for its duration)
+    // The free space scan walks the whole FAT (SdFat keeps no cached
+    // cluster count) and holds the card for seconds, so only start it when
+    // core0 has not touched the card for a while: serving map tiles beats
+    // knowing the free space. Write-triggered refreshes wait a minute on
+    // top of that.
     uint32_t interval = sd_stats_valid ? 60000 : 0;
-    if (last_scan == 0 || millis() - last_scan >= interval) {
+    if ((last_scan == 0 || millis() - last_scan >= interval) &&
+        millis() - sd_last_access >= 3000) {
       FSInfo info;
       mutex_enter_blocking(&sd_mutex);
-      bool ok = SDFS.info(info);
+      SDFS.info(info);
+      // info() reports success even when the FAT walk failed, and then
+      // returns a used count that wraps past the card size
+      bool ok = info.totalBytes > 0 && info.usedBytes <= info.totalBytes;
       if (ok) {
         sd_used_bytes = info.usedBytes;
         sd_free_bytes = info.totalBytes - info.usedBytes;
         sd_stats_valid = true;
         sd_stats_pending = false;
+      } else {
+        sd_close_cached_files();
       }
       mutex_exit(&sd_mutex);
       if (!ok)
-        sd_recheck = true; // info failing on a mounted card = card gone
+        sd_recheck = true; // a FAT walk only fails when the card is gone
       last_scan = millis();
     }
   }
@@ -224,7 +252,14 @@ void onNmeaReceived(char *nmea) {
 }
 
 static void gps_tx_drain(void) {
-  while (gps_tx_head != gps_tx_tail && softSerial2.availableForWrite() > 0) {
+  // SerialPIO::availableForWrite() returns 8 minus the fill level of a
+  // 4 deep TX FIFO, so it never reaches 0 and cannot be used to detect a
+  // full FIFO. write() blocks once the FIFO is full, so hand it a few
+  // bytes per pass and let the next pass continue: at 9600 baud a full
+  // ring would otherwise block the loop for two seconds.
+  const int fifo_depth = 4;
+  int free_slots = softSerial2.availableForWrite() - (8 - fifo_depth);
+  while (gps_tx_head != gps_tx_tail && free_slots-- > 0) {
     softSerial2.write(gps_tx_ring[gps_tx_tail]);
     gps_tx_tail = (gps_tx_tail + 1) % sizeof(gps_tx_ring);
   }
