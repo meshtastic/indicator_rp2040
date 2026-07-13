@@ -38,6 +38,9 @@ const int SD_CS_PIN = 13;
 // stalling the link, so GPS forwarding and other requests keep flowing.
 auto_init_mutex(sd_mutex);
 static volatile bool sd_mounted = false;
+// a mount attempt is running (or has not been tried yet): the card is not
+// usable right now, but whether one is present is not decided either
+static volatile bool sd_mounting = true;
 static volatile bool sd_recheck = false;
 // bumped on every unmount so serial_proto drops file handles that cannot
 // survive a remount
@@ -49,6 +52,7 @@ static volatile uint32_t sd_last_access = 0;
 
 // used/free statistics from the core1 scan
 static volatile bool sd_stats_pending = false;
+static volatile uint32_t stats_pending_since = 0;
 static bool sd_stats_valid = false;
 static uint64_t sd_used_bytes = 0;
 static uint64_t sd_free_bytes = 0;
@@ -61,16 +65,18 @@ static meshtastic_SdCardInfo sd_info_cache;
 // is mounting or scanning right now; the caller reports that instead of
 // waiting for it.
 int sd_claim(void) {
-  // checked before the try-lock: core1 holds the mutex for the whole
-  // (2 second) mount attempt on an empty slot, and answering BUSY there
-  // would make an empty slot look like a card that is merely busy
+  // Checked before the try-lock: core1 holds the mutex for the whole
+  // (2 second) mount attempt, and answering BUSY for an empty slot would
+  // make it look like a card that is merely busy. While a mount attempt is
+  // actually running, though, the outcome is not known yet: BUSY tells the
+  // requester to come back rather than to give up on the card.
   if (!sd_mounted)
-    return SD_CLAIM_NOCARD;
+    return sd_mounting ? SD_CLAIM_BUSY : SD_CLAIM_NOCARD;
   if (!mutex_try_enter(&sd_mutex, NULL))
     return SD_CLAIM_BUSY;
   if (!sd_mounted) {
     mutex_exit(&sd_mutex);
-    return SD_CLAIM_NOCARD;
+    return sd_mounting ? SD_CLAIM_BUSY : SD_CLAIM_NOCARD;
   }
   sd_last_access = millis(); // keeps core1 off the card while requests flow
   return SD_CLAIM_OK;
@@ -92,7 +98,12 @@ void sd_mark_dead(void) {
 }
 
 // A write changed the filesystem; refresh the stats (rate-limited on core1)
-void sd_note_write(void) { sd_stats_pending = true; }
+void sd_note_write(void) {
+  if (!sd_stats_pending) {
+    stats_pending_since = millis();
+    sd_stats_pending = true;
+  }
+}
 
 // Snapshot for get_sd_info, answered entirely from cached state so the
 // response never waits on the card
@@ -178,11 +189,13 @@ void loop1() {
     // this makes inserting (or re-inserting) a card after boot just work
     if (last_mount == 0 || millis() - last_mount >= 2000) {
       bool ok;
+      sd_mounting = true; // requests get BUSY, not "no card", until we know
       mutex_enter_blocking(&sd_mutex);
       if ((ok = SD.begin(SD_CS_PIN, 16000000, SPI1))) {
         sd_cache_card_info();
         sd_stats_valid = false;
         sd_stats_pending = true;
+        stats_pending_since = millis();
       }
       mutex_exit(&sd_mutex);
       if (ok) {
@@ -190,6 +203,7 @@ void loop1() {
         sd_mounted = true;
         Serial.println("card initialized.");
       }
+      sd_mounting = false;
       // stamped after the attempt: begin() spins for its full timeout
       // when the slot is empty
       last_mount = millis();
@@ -201,8 +215,12 @@ void loop1() {
     // knowing the free space. Write-triggered refreshes wait a minute on
     // top of that.
     uint32_t interval = sd_stats_valid ? 60000 : 0;
+    // A steady stream of tile reads would keep the card busy forever, so
+    // stop waiting for an idle window after a while and just take the card:
+    // the requester retries a BUSY response.
+    bool waited_long_enough = millis() - stats_pending_since >= 30000;
     if ((last_scan == 0 || millis() - last_scan >= interval) &&
-        millis() - sd_last_access >= 3000) {
+        (millis() - sd_last_access >= 3000 || waited_long_enough)) {
       FSInfo info;
       mutex_enter_blocking(&sd_mutex);
       SDFS.info(info);
