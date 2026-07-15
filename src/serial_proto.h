@@ -24,7 +24,13 @@ void mt_loop();
 enum { SD_CLAIM_OK = 0, SD_CLAIM_NOCARD, SD_CLAIM_BUSY };
 int sd_claim(void);
 void sd_release(void);
-void sd_mark_dead(void);
+// a card operation looked wrong: have core1 check whether the card is still
+// there (SdFat answers from cached state, only a re-init asks the card)
+void sd_request_verify(void);
+// release the card so it can be pulled safely, mount it again, or wipe it
+void sd_request_eject(void);
+void sd_request_mount(void);
+void sd_request_format(void);
 // drops cached file handles; called with the card mutex held, right before
 // core1 unmounts (implemented next to the caches, in serial_proto.cpp)
 void sd_close_cached_files(void);

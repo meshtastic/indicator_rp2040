@@ -104,18 +104,6 @@ static uint64_t file_size_of(const char *path) {
   return size;
 }
 
-// An operation on a path can fail because the path is wrong or because the
-// card is gone; only the card itself can tell us apart. Reading the root
-// directory touches the card, so a mounted card that cannot produce it has
-// been pulled. Called only on failure paths.
-static bool card_still_there(void) {
-  if (SD.exists("/"))
-    return true;
-  Serial.println("SD card stopped responding");
-  sd_mark_dead();
-  return false;
-}
-
 // Parse a packet that came in, and handle it. Return true if we were able to
 // parse it.
 bool mt_handle_packet(size_t payload_len) {
@@ -229,11 +217,9 @@ bool mt_handle_packet(size_t payload_len) {
         invalidate_read_cache();
         read_cache = SD.open(request.filepath, FILE_READ);
         if (!read_cache) {
-          // a pulled card fails exactly like a missing file, and map tiles
-          // are probed constantly: this is the path that must notice
-          out->status = card_still_there()
-                            ? meshtastic_FileStatus_FILE_NOT_FOUND
-                            : meshtastic_FileStatus_FILE_NO_CARD;
+          // a pulled card fails exactly like a missing file
+          out->status = meshtastic_FileStatus_FILE_NOT_FOUND;
+          sd_request_verify();
           break;
         }
         if (read_cache.isDirectory()) {
@@ -257,13 +243,13 @@ bool mt_handle_packet(size_t payload_len) {
       }
       if (!read_cache.seek((uint32_t)request.offset)) {
         out->status = meshtastic_FileStatus_FILE_IO_ERROR;
-        sd_mark_dead(); // in range, so the card itself failed
+        sd_request_verify(); // in range, so the card itself failed
         break;
       }
       int got = read_cache.read(out->filedata.bytes, want);
       if (got < 0) {
         out->status = meshtastic_FileStatus_FILE_IO_ERROR;
-        sd_mark_dead();
+        sd_request_verify();
         break;
       }
       out->filedata.size = got;
@@ -289,8 +275,8 @@ bool mt_handle_packet(size_t payload_len) {
       File f = SD.open(request.filepath, FILE_WRITE); // append mode, creates
       if (!f) {
         // a full card, a bad path and a pulled card all fail here
-        out->status = card_still_there() ? meshtastic_FileStatus_FILE_IO_ERROR
-                                         : meshtastic_FileStatus_FILE_NO_CARD;
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        sd_request_verify();
         strncpy(out->message, "open failed", sizeof(out->message) - 1);
         break;
       }
@@ -309,8 +295,8 @@ bool mt_handle_packet(size_t payload_len) {
       } else {
         // short write: a full card (do not unmount, it would thrash between
         // remounts) or a card that went away
-        out->status = card_still_there() ? meshtastic_FileStatus_FILE_IO_ERROR
-                                         : meshtastic_FileStatus_FILE_NO_CARD;
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        sd_request_verify();
         strncpy(out->message, "write failed", sizeof(out->message) - 1);
       }
       count_cache_path[0] = '\0';
@@ -326,8 +312,8 @@ bool mt_handle_packet(size_t payload_len) {
         out->status = meshtastic_FileStatus_FILE_OK;
         sd_account_bytes(-(int64_t)freed);
       } else {
-        out->status = card_still_there() ? meshtastic_FileStatus_FILE_IO_ERROR
-                                         : meshtastic_FileStatus_FILE_NO_CARD;
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        sd_request_verify();
         strncpy(out->message, "remove failed", sizeof(out->message) - 1);
       }
       count_cache_path[0] = '\0';
@@ -366,11 +352,10 @@ bool mt_handle_packet(size_t payload_len) {
     if (dir)
       dir.close();
     if (!is_dir) {
-      out->status =
-          SD.exists(request.directory)
-              ? meshtastic_FileStatus_FILE_NOT_A_FILE
-              : (card_still_there() ? meshtastic_FileStatus_FILE_NOT_FOUND
-                                    : meshtastic_FileStatus_FILE_NO_CARD);
+      out->status = SD.exists(request.directory)
+                        ? meshtastic_FileStatus_FILE_NOT_A_FILE
+                        : meshtastic_FileStatus_FILE_NOT_FOUND;
+      sd_request_verify();
     } else {
       const size_t max_names =
           sizeof(out->filenames) / sizeof(out->filenames[0]);
@@ -413,6 +398,31 @@ bool mt_handle_packet(size_t payload_len) {
     // SD card statistics, answered entirely from state cached at mount
     // time so the response never waits on the card (this also serves as
     // the readiness probe target for older ESP32 firmware)
+    meshtastic_InterdeviceMessage &response = tx_response;
+    memset(&response, 0, sizeof(response));
+    response.id = message.id; // correlate with the request
+    response.which_data = meshtastic_InterdeviceMessage_sd_info_tag;
+    sd_get_info(&response.data.sd_info);
+    return mt_send_uplink(response);
+  }
+
+  case meshtastic_InterdeviceMessage_sd_command_tag: {
+    // Mount or release the card. Core1 carries it out; the answer reports the
+    // state as it is right now, which for a mount is still "busy" (the mount
+    // takes a moment) and for an eject is already "no card".
+    switch (message.data.sd_command) {
+    case meshtastic_SdCommand_SD_EJECT:
+      sd_request_eject();
+      break;
+    case meshtastic_SdCommand_SD_MOUNT:
+      sd_request_mount();
+      break;
+    case meshtastic_SdCommand_SD_FORMAT:
+      sd_request_format();
+      break;
+    default:
+      break;
+    }
     meshtastic_InterdeviceMessage &response = tx_response;
     memset(&response, 0, sizeof(response));
     response.id = message.id; // correlate with the request

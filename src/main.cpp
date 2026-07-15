@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <SD.h>
 #include <SPI.h>
+#include <SdFat.h>
 #include <Wire.h>
 #include <pico/mutex.h>
 
@@ -41,7 +42,16 @@ static volatile bool sd_mounted = false;
 // a mount attempt is running (or has not been tried yet): the card is not
 // usable right now, but whether one is present is not decided either
 static volatile bool sd_mounting = true;
-static volatile bool sd_recheck = false;
+// core1 should re-init the card to see whether it is still in the slot
+static volatile bool sd_verify_pending = false;
+// The card was ejected on request: it stays released (no automatic remount)
+// so it can be pulled safely, until a mount is asked for.
+static volatile bool sd_ejected = false;
+static volatile bool sd_eject_pending = false;
+static volatile bool sd_mount_requested = false;
+static volatile bool sd_format_requested = false;
+// a card answers in the slot but has no filesystem we can mount
+static volatile bool sd_unformatted = false;
 // bumped on every unmount so serial_proto drops file handles that cannot
 // survive a remount
 volatile uint32_t sd_generation = 0;
@@ -65,6 +75,8 @@ static meshtastic_SdCardInfo sd_info_cache;
 // is mounting or scanning right now; the caller reports that instead of
 // waiting for it.
 int sd_claim(void) {
+  if (sd_ejected)
+    return SD_CLAIM_NOCARD; // released on request, do not touch it
   // Checked before the try-lock: core1 holds the mutex for the whole
   // (2 second) mount attempt, and answering BUSY for an empty slot would
   // make it look like a card that is merely busy. While a mount attempt is
@@ -87,14 +99,35 @@ void sd_release(void) {
   mutex_exit(&sd_mutex);
 }
 
-// A card-level failure was observed on a mounted card: assume it was
-// pulled and have core1 recover with a clean remount. Only for genuine
-// card failures: a full card or a bad path must not unmount anything.
-// The caller still holds the mutex, so drop the cached handle here rather
-// than after the remount, when it would belong to the old volume.
-void sd_mark_dead(void) {
-  sd_close_cached_files();
-  sd_recheck = true;
+// Something looked wrong with the card, or nothing has been asked of it for
+// a while: have core1 verify it is still there. Cheap and rate limited, so
+// callers can ask on any suspicious failure.
+void sd_request_verify(void) { sd_verify_pending = true; }
+
+// Flush the card and release it so it can be pulled without corrupting it.
+// It stays released until sd_request_mount().
+void sd_request_eject(void) {
+  sd_ejected = true; // reported as gone right away, core1 tears it down
+  sd_eject_pending = true;
+}
+
+// Mount whatever is in the slot, also after an eject. Mounting a card that is
+// already mounted is a no-op: it must not report itself busy, because only the
+// mount path below clears that again.
+void sd_request_mount(void) {
+  sd_ejected = false;
+  if (sd_mounted)
+    return;
+  sd_mounting = true;        // reported as busy until core1 knows better
+  sd_mount_requested = true; // without waiting out the retry interval
+}
+
+// Put a fresh filesystem on the card. Takes seconds and destroys everything
+// on it; the card is mounted again afterwards.
+void sd_request_format(void) {
+  sd_ejected = false;
+  sd_mounting = true;
+  sd_format_requested = true;
 }
 
 // A write changed the filesystem by this many bytes (negative when it freed
@@ -122,14 +155,22 @@ void sd_account_bytes(int64_t delta) {
 // response never waits on the card
 void sd_get_info(meshtastic_SdCardInfo *out) {
   memset(out, 0, sizeof(*out));
-  if (sd_mounting) {
-    // no card mounted, but whether one is present is not decided yet: the
-    // requester must ask again instead of reporting an empty slot
-    out->busy = true;
+  if (sd_ejected)
+    return; // released on request: gone as far as anyone else is concerned
+  if (!sd_mounted) {
+    // asked before anything else: a mounted card is never busy, whatever a
+    // stale flag might say, and a caller that waits out a busy card forever
+    // is a frozen screen
+    if (sd_mounting) {
+      // whether a card is present is not decided yet, so asking again beats
+      // reporting an empty slot
+      out->busy = true;
+    } else if (sd_unformatted) {
+      // a card is in there, it just has nothing we can mount
+      out->unformatted = true;
+    }
     return;
   }
-  if (!sd_mounted)
-    return;
   // Never waits for the card: core1 can hold the mutex for seconds. The
   // identity cache is only rewritten while unmounted, so a generation that
   // did not change across the copy proves it did not come from two cards.
@@ -191,25 +232,136 @@ void setup1() {
   SPI1.setRX(12);
 }
 
-void loop1() {
-  static uint32_t last_mount = 0;
+// The card sits on SPI1, and every raw card access has to say so: a config
+// without a port falls back to SPI0, whose default pins carry the serial link
+// to the main firmware (16/17), so it would tear the link down.
+static SdSpiConfig sd_spi_config(void) {
+  return SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(16), &SPI1);
+}
 
-  if (sd_recheck) {
-    mutex_enter_blocking(&sd_mutex);
+// Does a card answer in the slot at all, filesystem or not? SD.begin() cannot
+// tell an empty slot from a card without a filesystem, but the card responds
+// to the SPI init either way. Caller holds the mutex, card must be unmounted.
+static bool sd_card_responds(void) {
+  SdCardFactory factory;
+  SdCard *card = factory.newCard(sd_spi_config());
+  return card && !card->errorCode();
+}
+
+// Put a fresh FAT on the card. Not SDFS.format(): that one builds its card
+// config without a SPI port, so it would run on SPI0 and re-mux the pins of
+// the interdevice link. Caller holds the mutex, card must be unmounted.
+static bool sd_format_card(void) {
+  SdCardFactory factory;
+  SdCard *card = factory.newCard(sd_spi_config());
+  if (!card || card->errorCode())
+    return false;
+  static uint8_t sector[512]; // too big for the core stack
+  FatFormatter formatter;
+  return formatter.format(card, sector, nullptr);
+}
+
+// Is the card still in the slot? SdFat answers type()/fatType() and even a
+// root directory lookup from state cached at mount time, so the only way to
+// ask the card itself is to initialize it again: that clocks CMD0/ACMD41
+// over SPI and fails when the slot is empty. Caller must be core1.
+static bool sd_verify_card(void) {
+  uint64_t was = sd_info_cache.card_size;
+  bool ok;
+  mutex_enter_blocking(&sd_mutex);
+  // the handles and cached sectors belong to the volume we are about to
+  // tear down, whatever the outcome
+  sd_close_cached_files();
+  sd_generation++;
+  SD.end(false);
+  ok = SD.begin(SD_CS_PIN, 16000000, SPI1);
+  if (ok) {
+    sd_cache_card_info();
+    // the card stays mounted across a verify, so core0 may be reading the
+    // identity cache while it is rewritten here: bumping again makes such a
+    // copy visibly straddle two generations and be discarded
+    sd_generation++;
+    if (sd_info_cache.card_size != was) {
+      // a different card: the free space we know belongs to the old one
+      sd_stats_valid = false;
+      sd_stats_pending = true;
+      stats_pending_since = millis();
+      Serial.println("SD card replaced");
+    }
+  } else {
     sd_mounted = false;
     sd_stats_valid = false;
-    sd_generation++;
-    // core0 may have re-opened a handle between marking the card dead and
-    // this point; it must not outlive the volume it belongs to
-    sd_close_cached_files();
-    SD.end(false);
-    mutex_exit(&sd_mutex);
-    sd_recheck = false;
-    last_mount = 0; // retry immediately
-    Serial.println("SD card lost, remounting");
+  }
+  mutex_exit(&sd_mutex);
+  if (!ok)
+    Serial.println("SD card removed");
+  return ok;
+}
+
+void loop1() {
+  static uint32_t last_mount = 0;
+  static uint32_t last_verify = 0;
+
+  if (sd_mount_requested) {
+    sd_mount_requested = false;
+    last_mount = 0; // try right away, whatever the retry interval says
   }
 
-  if (!sd_mounted) {
+  // only the mount attempt below can clear this, so a mounted card must never
+  // be left reporting itself busy
+  if (sd_mounted && sd_mounting)
+    sd_mounting = false;
+
+  // Ejected on request: flush and release the card, then leave the slot alone
+  // so it can be pulled. Only a mount request brings it back.
+  if (sd_eject_pending) {
+    sd_eject_pending = false;
+    if (sd_mounted) {
+      mutex_enter_blocking(&sd_mutex);
+      sd_mounted = false;
+      sd_stats_valid = false;
+      sd_generation++;
+      sd_close_cached_files(); // flushes what is still open
+      SD.end(false);
+      mutex_exit(&sd_mutex);
+    }
+    Serial.println("SD card ejected, safe to remove");
+  }
+
+  // The slot has no card-detect line, so a card that is pulled while nothing
+  // is being read goes unnoticed until something fails. Ask the card itself,
+  // but only while core0 is not using it: a verify re-initializes the card,
+  // which drops the read cache and costs a few ms (and a full 2 second
+  // timeout once, when the card is really gone).
+  if (sd_mounted && !sd_ejected &&
+      (sd_verify_pending || millis() - last_verify >= 5000) &&
+      millis() - sd_last_access >= 1000) {
+    sd_verify_pending = false;
+    last_verify = millis();
+    if (!sd_verify_card())
+      last_mount = 0; // look for a new card right away
+  }
+
+  // Formatting needs the card unmounted, and destroys everything on it. Only
+  // ever on request, never as a reaction to a card that fails to mount.
+  if (sd_format_requested) {
+    sd_format_requested = false;
+    mutex_enter_blocking(&sd_mutex);
+    if (sd_mounted) {
+      sd_mounted = false;
+      sd_generation++;
+      sd_close_cached_files();
+      SD.end(false);
+    }
+    sd_stats_valid = false;
+    bool ok = sd_format_card();
+    mutex_exit(&sd_mutex);
+    Serial.println(ok ? "SD card formatted" : "SD card format failed");
+    sd_unformatted = !ok;
+    last_mount = 0; // mount the fresh filesystem
+  }
+
+  if (!sd_mounted && !sd_ejected) {
     // The Indicator's slot has no card-detect line, so retry rate-limited;
     // this makes inserting (or re-inserting) a card after boot just work
     if (last_mount == 0 || millis() - last_mount >= 2000) {
@@ -221,6 +373,11 @@ void loop1() {
         sd_stats_valid = false;
         sd_stats_pending = true;
         stats_pending_since = millis();
+        sd_unformatted = false;
+      } else {
+        // mount failed: a card that answers but carries no filesystem is not
+        // an empty slot, and the user can format it
+        sd_unformatted = sd_card_responds();
       }
       mutex_exit(&sd_mutex);
       if (ok) {
@@ -228,13 +385,15 @@ void loop1() {
         sd_mounted = true;
         sd_last_access = millis(); // the idle window starts here
         Serial.println("card initialized.");
+      } else if (sd_unformatted) {
+        Serial.println("SD card has no filesystem");
       }
       sd_mounting = false;
       // stamped after the attempt: begin() spins for its full timeout
       // when the slot is empty
       last_mount = millis();
     }
-  } else if (sd_stats_pending) {
+  } else if (sd_mounted && sd_stats_pending) {
     // The free space scan walks the whole FAT (SdFat keeps no cached cluster
     // count) and holds the card for seconds, so it runs once per mount and
     // only when core0 has not touched the card for a while: serving map
@@ -262,7 +421,7 @@ void loop1() {
       }
       mutex_exit(&sd_mutex);
       if (!ok)
-        sd_recheck = true; // a FAT walk only fails when the card is gone
+        sd_verify_pending = true; // a FAT walk only fails when the card is gone
     }
   }
   delay(20);
