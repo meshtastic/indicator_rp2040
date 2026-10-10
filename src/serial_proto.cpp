@@ -217,9 +217,12 @@ bool mt_handle_packet(size_t payload_len) {
         invalidate_read_cache();
         read_cache = SD.open(request.filepath, FILE_READ);
         if (!read_cache) {
-          // a pulled card fails exactly like a missing file
+          // a pulled card fails like a missing file, but misses are routine
+          // (a map asks for every tile it might have): only verify when the
+          // card itself failed a command
           out->status = meshtastic_FileStatus_FILE_NOT_FOUND;
-          sd_request_verify();
+          if (sd_card_failed())
+            sd_request_verify();
           break;
         }
         if (read_cache.isDirectory()) {
@@ -355,7 +358,8 @@ bool mt_handle_packet(size_t payload_len) {
       out->status = SD.exists(request.directory)
                         ? meshtastic_FileStatus_FILE_NOT_A_FILE
                         : meshtastic_FileStatus_FILE_NOT_FOUND;
-      sd_request_verify();
+      if (sd_card_failed()) // see GET
+        sd_request_verify();
     } else {
       const size_t max_names =
           sizeof(out->filenames) / sizeof(out->filenames[0]);

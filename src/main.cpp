@@ -42,7 +42,7 @@ static volatile bool sd_mounted = false;
 // a mount attempt is running (or has not been tried yet): the card is not
 // usable right now, but whether one is present is not decided either
 static volatile bool sd_mounting = true;
-// core1 should re-init the card to see whether it is still in the slot
+// core1 should ask the card whether it is still in the slot
 static volatile bool sd_verify_pending = false;
 // The card was ejected on request: it stays released (no automatic remount)
 // so it can be pulled safely, until a mount is asked for.
@@ -68,6 +68,23 @@ static uint64_t sd_used_bytes = 0;
 static uint64_t sd_free_bytes = 0;
 // card identity, cached at mount time so get_sd_info never touches the card
 static meshtastic_SdCardInfo sd_info_cache;
+// the card's CID register (maker, serial number), read at mount time: a
+// verify asks the card for it again instead of re-initializing it
+static cid_t sd_cid;
+static bool sd_cid_valid = false;
+
+// SdFat's card object sits behind two protected members (FS::_impl and
+// SDFSImpl::getFs). A derived class may take a pointer to such a member and
+// use it on the SDFS instance; no object of these types is ever made.
+struct FsAccess : fs::FS {
+  static fs::FSImpl *impl(fs::FS &f) { return (f.*(&FsAccess::_impl)).get(); }
+};
+struct SdfsAccess : sdfs::SDFSImpl {
+  static SdCard *card(void) {
+    sdfs::SDFSImpl *impl = static_cast<sdfs::SDFSImpl *>(FsAccess::impl(SDFS));
+    return (impl->*(&SdfsAccess::getFs))()->card();
+  }
+};
 
 // ---- core0 interface (used by serial_proto.cpp) ----
 
@@ -103,6 +120,14 @@ void sd_release(void) {
 // a while: have core1 verify it is still there. Cheap and rate limited, so
 // callers can ask on any suspicious failure.
 void sd_request_verify(void) { sd_verify_pending = true; }
+
+// Did the card itself fail a command since it was mounted? SdFat keeps the
+// card's error until the next init, and a missing file or a full card do not
+// set it. Caller has the card claimed.
+bool sd_card_failed(void) {
+  SdCard *card = SdfsAccess::card();
+  return !card || card->errorCode() != SD_CARD_ERROR_NONE;
+}
 
 // Flush the card and release it so it can be pulled without corrupting it.
 // It stays released until sd_request_mount().
@@ -194,6 +219,8 @@ void sd_get_info(meshtastic_SdCardInfo *out) {
 // caller holds sd_mutex, card is freshly mounted
 static void sd_cache_card_info(void) {
   memset(&sd_info_cache, 0, sizeof(sd_info_cache));
+  SdCard *card = SdfsAccess::card();
+  sd_cid_valid = card && card->readCID(&sd_cid);
   sd_info_cache.card_size = SD.size64();
   switch (SD.fatType()) {
   case 16:
@@ -262,13 +289,28 @@ static bool sd_format_card(void) {
 }
 
 // Is the card still in the slot? SdFat answers type()/fatType() and even a
-// root directory lookup from state cached at mount time, so the only way to
-// ask the card itself is to initialize it again: that clocks CMD0/ACMD41
-// over SPI and fails when the slot is empty. Caller must be core1.
+// root directory lookup from state cached at mount time, so ask the card for
+// its CID: one short command that leaves the volume, its caches and open
+// files alone. A pulled card does not answer, and neither does one put in its
+// place (it has not been switched to SPI mode yet). Only when that fails, or
+// the card failed a command since the mount (a failed sector read can leave
+// garbage in SdFat's sector cache), initialize it again: that clocks
+// CMD0/ACMD41 over SPI, fails when the slot is empty, and otherwise remounts.
+// A remount also resets SdFat's free cluster search, so the next new file
+// walks the FAT from its start: seconds on a card full of map tiles.
+// Caller must be core1.
 static bool sd_verify_card(void) {
   uint64_t was = sd_info_cache.card_size;
+  cid_t was_cid = sd_cid;
+  bool had_cid = sd_cid_valid;
+  cid_t cid;
   bool ok;
   mutex_enter_blocking(&sd_mutex);
+  if (sd_cid_valid && !sd_card_failed() && SdfsAccess::card()->readCID(&cid) &&
+      memcmp(&cid, &sd_cid, sizeof(cid)) == 0) {
+    mutex_exit(&sd_mutex);
+    return true;
+  }
   // the handles and cached sectors belong to the volume we are about to
   // tear down, whatever the outcome
   sd_close_cached_files();
@@ -281,7 +323,9 @@ static bool sd_verify_card(void) {
     // identity cache while it is rewritten here: bumping again makes such a
     // copy visibly straddle two generations and be discarded
     sd_generation++;
-    if (sd_info_cache.card_size != was) {
+    if (sd_info_cache.card_size != was ||
+        (had_cid && sd_cid_valid &&
+         memcmp(&sd_cid, &was_cid, sizeof(sd_cid)) != 0)) {
       // a different card: the free space we know belongs to the old one
       sd_stats_valid = false;
       sd_stats_pending = true;
@@ -330,9 +374,9 @@ void loop1() {
 
   // The slot has no card-detect line, so a card that is pulled while nothing
   // is being read goes unnoticed until something fails. Ask the card itself,
-  // but only while core0 is not using it: a verify re-initializes the card,
-  // which drops the read cache and costs a few ms (and a full 2 second
-  // timeout once, when the card is really gone).
+  // but only while core0 is not using it: a verify sends the card a command,
+  // and re-initializes it when that fails, which drops the read cache (and
+  // spins a full 2 second timeout once, when the card is really gone).
   if (sd_mounted && !sd_ejected &&
       (sd_verify_pending || millis() - last_verify >= 5000) &&
       millis() - sd_last_access >= 1000) {
