@@ -25,8 +25,11 @@ enum { SD_CLAIM_OK = 0, SD_CLAIM_NOCARD, SD_CLAIM_BUSY };
 int sd_claim(void);
 void sd_release(void);
 // a card operation looked wrong: have core1 check whether the card is still
-// there (SdFat answers from cached state, only a re-init asks the card)
+// there (SdFat answers from cached state, so core1 asks the card itself)
 void sd_request_verify(void);
+// the card failed a command since it was mounted (a missing file or a full
+// card does not count); call with the card claimed
+bool sd_card_failed(void);
 // release the card so it can be pulled safely, mount it again, or wipe it
 void sd_request_eject(void);
 void sd_request_mount(void);
