@@ -30,7 +30,8 @@ typedef enum _meshtastic_FileOperation {
     meshtastic_FileOperation_GET = 0,
     meshtastic_FileOperation_POST = 1,
     meshtastic_FileOperation_PUT = 2,
-    meshtastic_FileOperation_DELETE = 3
+    meshtastic_FileOperation_DELETE = 3,
+    meshtastic_FileOperation_MKDIR = 4 /* Create a directory, parents included; OK when it already exists */
 } meshtastic_FileOperation;
 
 /* Outcome of a file or directory operation. The requester must be able to
@@ -211,8 +212,8 @@ extern "C" {
 #define _meshtastic_InterdeviceVersion_ARRAYSIZE ((meshtastic_InterdeviceVersion)(meshtastic_InterdeviceVersion_INTERDEVICE_VERSION_CURRENT+1))
 
 #define _meshtastic_FileOperation_MIN meshtastic_FileOperation_GET
-#define _meshtastic_FileOperation_MAX meshtastic_FileOperation_DELETE
-#define _meshtastic_FileOperation_ARRAYSIZE ((meshtastic_FileOperation)(meshtastic_FileOperation_DELETE+1))
+#define _meshtastic_FileOperation_MAX meshtastic_FileOperation_MKDIR
+#define _meshtastic_FileOperation_ARRAYSIZE ((meshtastic_FileOperation)(meshtastic_FileOperation_MKDIR+1))
 
 #define _meshtastic_FileStatus_MIN meshtastic_FileStatus_FILE_UNSPECIFIED
 #define _meshtastic_FileStatus_MAX meshtastic_FileStatus_FILE_NOT_A_FILE

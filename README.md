@@ -18,7 +18,7 @@
 This firmware turns the RP2040 into a peripheral bridge for the main Meshtastic CPU, exchanging framed protobuf messages over the interboard UART link:
 - **GPS**: forwards NMEA sentences from the onboard GNSS module to the main CPU, and relays configuration back down to the module
 - **I2C bridge**: runs read/write transactions and bus scans on the secondary I2C bus on behalf of the main CPU
-- **SD card**: chunked file read and write, directory listing and free-space statistics, plus mount, eject and format on request, with detection of a card inserted or removed while running
+- **SD card**: chunked file read and write, directory creation and listing, free-space statistics, plus mount, eject and format on request, with detection of a card inserted or removed while running
 - **Buzzer**: tone control on request
 
 ## Installation
