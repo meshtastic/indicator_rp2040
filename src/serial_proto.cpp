@@ -303,6 +303,64 @@ bool mt_handle_packet(size_t payload_len) {
       break;
     }
 
+    case meshtastic_FileOperation_MKDIR: {
+      invalidate_read_cache();
+      File existing = SD.open(request.filepath, FILE_READ);
+      bool is_dir = existing && existing.isDirectory();
+      bool is_file = existing && !is_dir;
+      if (existing)
+        existing.close();
+      if (is_dir) {
+        out->status = meshtastic_FileStatus_FILE_OK; // already there
+      } else if (is_file) {
+        out->status = meshtastic_FileStatus_FILE_NOT_A_FILE;
+        strncpy(out->message, "a file has that name", sizeof(out->message) - 1);
+      } else if (SD.mkdir(request.filepath)) { // parents included
+        out->status = meshtastic_FileStatus_FILE_OK;
+      } else {
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        sd_request_verify();
+        strncpy(out->message, "mkdir failed", sizeof(out->message) - 1);
+      }
+      count_cache_path[0] = '\0';
+      break;
+    }
+
+    case meshtastic_FileOperation_RMDIR: {
+      invalidate_read_cache();
+      File dir = SD.open(request.filepath, FILE_READ);
+      bool exists = dir;
+      bool is_dir = exists && dir.isDirectory();
+      bool has_entries = false;
+      if (is_dir) {
+        File entry = dir.openNextFile();
+        has_entries = entry;
+        if (entry)
+          entry.close();
+      }
+      if (exists)
+        dir.close();
+      if (!exists) {
+        // idempotent like DELETE: a retried rmdir after a lost response
+        // finds the directory already gone
+        out->status = meshtastic_FileStatus_FILE_OK;
+      } else if (!is_dir) {
+        out->status = meshtastic_FileStatus_FILE_NOT_A_FILE;
+        strncpy(out->message, "a file has that name", sizeof(out->message) - 1);
+      } else if (has_entries) {
+        out->status = meshtastic_FileStatus_FILE_NOT_EMPTY;
+        strncpy(out->message, "directory not empty", sizeof(out->message) - 1);
+      } else if (SD.rmdir(request.filepath)) {
+        out->status = meshtastic_FileStatus_FILE_OK;
+      } else {
+        out->status = meshtastic_FileStatus_FILE_IO_ERROR;
+        sd_request_verify();
+        strncpy(out->message, "rmdir failed", sizeof(out->message) - 1);
+      }
+      count_cache_path[0] = '\0';
+      break;
+    }
+
     case meshtastic_FileOperation_DELETE: {
       invalidate_read_cache();
       uint64_t freed = file_size_of(request.filepath);
